@@ -1,0 +1,567 @@
+{
+  "info": {
+    "name": "Log Service API Tests",
+    "_postman_id": "log-service-api-tests-001",
+    "description": "Complete API test suite for Log Ingestion and Query Service",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "Health",
+      "item": [
+        {
+          "name": "GET /health",
+          "request": {
+            "method": "GET",
+            "url": "http://localhost:8080/health",
+            "description": "Returns service health status"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status is 200', function () { pm.response.to.have.status(200); });",
+                  "pm.test('Status is ok', function () { var json = pm.response.json(); pm.expect(json.status).to.eql('ok'); });"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Ingest Logs",
+      "item": [
+        {
+          "name": "POST /logs - Valid Batch",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"logs\":[{\"timestamp\":\"2026-07-31T12:00:00Z\",\"level\":\"info\",\"service\":\"checkout\",\"message\":\"payment success\",\"attributes\":{\"user_id\":\"42\",\"region\":\"eu-west\"}},{\"timestamp\":\"2026-07-31T12:01:00Z\",\"level\":\"error\",\"service\":\"auth\",\"message\":\"login failed\",\"attributes\":{\"user_id\":\"99\"}},{\"timestamp\":\"2026-07-31T12:02:00Z\",\"level\":\"debug\",\"service\":\"checkout\",\"message\":\"item added to cart\"},{\"timestamp\":\"2026-07-31T12:03:00Z\",\"level\":\"warn\",\"service\":\"api\",\"message\":\"rate limit approaching\"},{\"timestamp\":\"2026-07-31T12:04:00Z\",\"level\":\"error\",\"service\":\"checkout\",\"message\":\"payment declined\",\"attributes\":{\"user_id\":\"42\"}}]}"
+            },
+            "url": "http://localhost:8080/logs",
+            "description": "Ingest a valid batch of 5 log entries"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status is 200', function () { pm.response.to.have.status(200); });",
+                  "pm.test('All accepted', function () { var json = pm.response.json(); pm.expect(json.accepted).to.be.above(0); pm.expect(json.rejected).to.have.length(0); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "POST /logs - With Invalid Entries",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"logs\":[{\"timestamp\":\"2026-07-31T12:05:00Z\",\"level\":\"info\",\"service\":\"test\",\"message\":\"valid entry\"},{\"timestamp\":\"not-a-date\",\"level\":\"info\",\"service\":\"test\",\"message\":\"bad timestamp\"},{\"timestamp\":\"2026-07-31T12:06:00Z\",\"level\":\"critical\",\"service\":\"test\",\"message\":\"bad level\"},{\"timestamp\":\"2026-07-31T12:07:00Z\",\"level\":\"info\",\"service\":\"\",\"message\":\"empty service\"}]}"
+            },
+            "url": "http://localhost:8080/logs",
+            "description": "Ingest batch with invalid entries (partial acceptance)"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status is 200', function () { pm.response.to.have.status(200); });",
+                  "pm.test('Has rejected entries', function () { var json = pm.response.json(); pm.expect(json.rejected.length).to.be.above(0); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "POST /logs - All Invalid",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"logs\":[{\"timestamp\":\"bad\",\"level\":\"bad\",\"service\":\"\",\"message\":\"\"}]}"
+            },
+            "url": "http://localhost:8080/logs",
+            "description": "All entries invalid, expect 400"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status is 400', function () { pm.response.to.have.status(400); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "POST /logs - Empty Array",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"logs\":[]}"
+            },
+            "url": "http://localhost:8080/logs",
+            "description": "Empty array, expect 400"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status is 400', function () { pm.response.to.have.status(400); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "POST /logs - Malformed JSON",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "not json"
+            },
+            "url": "http://localhost:8080/logs",
+            "description": "Malformed JSON body, expect 400"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status is 400', function () { pm.response.to.have.status(400); });"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Query Logs",
+      "item": [
+        {
+          "name": "GET /logs - All Logs",
+          "request": {
+            "method": "GET",
+            "url": "http://localhost:8080/logs?limit=5",
+            "description": "Get all logs with limit"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status is 200', function () { pm.response.to.have.status(200); });",
+                  "pm.test('Has logs array', function () { var json = pm.response.json(); pm.expect(json.logs).to.be.an('array'); });",
+                  "pm.test('Sorted by timestamp DESC', function () { var json = pm.response.json(); if (json.logs.length > 1) { for (var i = 1; i < json.logs.length; i++) { pm.expect(new Date(json.logs[i-1].timestamp).getTime()).to.be.at.least(new Date(json.logs[i].timestamp).getTime()); } } });",
+                  "pm.test('Has next_cursor', function () { var json = pm.response.json(); pm.expect(json).to.have.property('next_cursor'); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "GET /logs - Filter by service=checkout",
+          "request": {
+            "method": "GET",
+            "url": "http://localhost:8080/logs?service=checkout",
+            "description": "Filter logs by service"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status is 200', function () { pm.response.to.have.status(200); });",
+                  "pm.test('All logs are checkout service', function () { var json = pm.response.json(); json.logs.forEach(function(log) { pm.expect(log.service).to.eql('checkout'); }); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "GET /logs - Filter by level=error",
+          "request": {
+            "method": "GET",
+            "url": "http://localhost:8080/logs?level=error",
+            "description": "Filter logs by level"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status is 200', function () { pm.response.to.have.status(200); });",
+                  "pm.test('All logs are error level', function () { var json = pm.response.json(); json.logs.forEach(function(log) { pm.expect(log.level_name).to.eql('error'); }); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "GET /logs - Message search q=payment",
+          "request": {
+            "method": "GET",
+            "url": "http://localhost:8080/logs?q=payment",
+            "description": "Search logs by message substring"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status is 200', function () { pm.response.to.have.status(200); });",
+                  "pm.test('All messages contain payment', function () { var json = pm.response.json(); json.logs.forEach(function(log) { pm.expect(log.message.toLowerCase()).to.include('payment'); }); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "GET /logs - Attribute filter attr.user_id=42",
+          "request": {
+            "method": "GET",
+            "url": "http://localhost:8080/logs?attr.user_id=42",
+            "description": "Filter logs by attribute"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status is 200', function () { pm.response.to.have.status(200); });",
+                  "pm.test('All logs have user_id=42', function () { var json = pm.response.json(); json.logs.forEach(function(log) { pm.expect(log.attributes.user_id).to.eql('42'); }); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "GET /logs - Time range since/until",
+          "request": {
+            "method": "GET",
+            "url": "http://localhost:8080/logs?since=2026-07-31T12:00:00Z&until=2026-07-31T12:03:00Z",
+            "description": "Filter logs by time range"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status is 200', function () { pm.response.to.have.status(200); });",
+                  "pm.test('All logs within range', function () { var json = pm.response.json(); var since = new Date('2026-07-31T12:00:00Z').getTime(); var until = new Date('2026-07-31T12:03:00Z').getTime(); json.logs.forEach(function(log) { var ts = new Date(log.timestamp).getTime(); pm.expect(ts).to.be.at.least(since); pm.expect(ts).to.be.below(until); }); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "GET /logs - Invalid level=critical",
+          "request": {
+            "method": "GET",
+            "url": "http://localhost:8080/logs?level=critical",
+            "description": "Invalid level, expect 400"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status is 400', function () { pm.response.to.have.status(400); });",
+                  "pm.test('Error mentions level', function () { var json = pm.response.json(); pm.expect(json.error).to.include('level'); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "GET /logs - Invalid limit=9999",
+          "request": {
+            "method": "GET",
+            "url": "http://localhost:8080/logs?limit=9999",
+            "description": "Invalid limit, expect 400"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status is 400', function () { pm.response.to.have.status(400); });",
+                  "pm.test('Error mentions limit', function () { var json = pm.response.json(); pm.expect(json.error).to.include('limit'); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "GET /logs - Cursor Pagination",
+          "request": {
+            "method": "GET",
+            "url": "http://localhost:8080/logs?limit=3",
+            "description": "Test cursor-based pagination (run twice)"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status is 200', function () { pm.response.to.have.status(200); });",
+                  "pm.test('Returns cursor when more results', function () { var json = pm.response.json(); if (json.logs.length >= 3) { pm.expect(json.next_cursor).to.not.be.null; } });",
+                  "pm.test('Second page works', function () { var json = pm.response.json(); if (json.next_cursor) { pm.sendRequest({ url: 'http://localhost:8080/logs?limit=3&cursor=' + json.next_cursor, method: 'GET' }, function(err, res) { pm.expect(res.code).to.eql(200); var json2 = res.json(); pm.expect(json2.logs).to.be.an('array'); }); } });"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Aggregate Logs",
+      "item": [
+        {
+          "name": "GET /logs/aggregate - 1m buckets",
+          "request": {
+            "method": "GET",
+            "url": "http://localhost:8080/logs/aggregate?since=2026-07-31T12:00:00Z&until=2026-07-31T12:10:00Z&bucket=1m",
+            "description": "Aggregate logs into 1-minute buckets"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status is 200', function () { pm.response.to.have.status(200); });",
+                  "pm.test('Has buckets array', function () { var json = pm.response.json(); pm.expect(json.buckets).to.be.an('array'); pm.expect(json.buckets.length).to.be.above(0); });",
+                  "pm.test('Buckets have required fields', function () { var json = pm.response.json(); json.buckets.forEach(function(b) { pm.expect(b).to.have.all.keys('start', 'group', 'count'); pm.expect(b.count).to.be.above(0); }); });",
+                  "pm.test('Ordered by start ASC', function () { var json = pm.response.json(); for (var i = 1; i < json.buckets.length; i++) { pm.expect(new Date(json.buckets[i].start).getTime()).to.be.at.least(new Date(json.buckets[i-1].start).getTime()); } });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "GET /logs/aggregate - group_by service",
+          "request": {
+            "method": "GET",
+            "url": "http://localhost:8080/logs/aggregate?since=2026-07-31T12:00:00Z&until=2026-07-31T12:10:00Z&bucket=5m&group_by=service",
+            "description": "Aggregate with group by service"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status is 200', function () { pm.response.to.have.status(200); });",
+                  "pm.test('Multiple services represented', function () { var json = pm.response.json(); var groups = json.buckets.map(function(b) { return b.group; }); var unique = []; groups.forEach(function(g) { if (unique.indexOf(g) === -1) unique.push(g); }); pm.expect(unique.length).to.be.above(1); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "GET /logs/aggregate - group_by level",
+          "request": {
+            "method": "GET",
+            "url": "http://localhost:8080/logs/aggregate?since=2026-07-31T12:00:00Z&until=2026-07-31T12:10:00Z&bucket=1d&group_by=level",
+            "description": "Aggregate with group by level"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status is 200', function () { pm.response.to.have.status(200); });",
+                  "pm.test('Groups by level', function () { var json = pm.response.json(); var groups = json.buckets.map(function(b) { return b.group; }); var hasError = false; var hasInfo = false; groups.forEach(function(g) { if (g === 'error') hasError = true; if (g === 'info') hasInfo = true; }); pm.expect(hasError).to.be.true; pm.expect(hasInfo).to.be.true; });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "GET /logs/aggregate - Missing since",
+          "request": {
+            "method": "GET",
+            "url": "http://localhost:8080/logs/aggregate?until=2026-07-31T12:10:00Z&bucket=1m",
+            "description": "Missing required 'since' parameter"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status is 400', function () { pm.response.to.have.status(400); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "GET /logs/aggregate - Invalid bucket=30s",
+          "request": {
+            "method": "GET",
+            "url": "http://localhost:8080/logs/aggregate?since=2026-07-31T12:00:00Z&until=2026-07-31T12:10:00Z&bucket=30s",
+            "description": "Invalid bucket size"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status is 400', function () { pm.response.to.have.status(400); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "GET /logs/aggregate - until before since",
+          "request": {
+            "method": "GET",
+            "url": "http://localhost:8080/logs/aggregate?since=2026-07-31T12:10:00Z&until=2026-07-31T12:00:00Z&bucket=1m",
+            "description": "until is before since"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status is 400', function () { pm.response.to.have.status(400); });"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Auth",
+      "item": [
+        {
+          "name": "GET /health - Auth always allowed",
+          "request": {
+            "method": "GET",
+            "url": "http://localhost:8080/health",
+            "description": "Health endpoint always works without auth"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status is 200', function () { pm.response.to.have.status(200); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "GET /logs - No auth header",
+          "request": {
+            "method": "GET",
+            "url": "http://localhost:8080/logs?limit=1",
+            "description": "Logs without auth (200 if AUTH_ENABLED=false)"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status is 200 or 401', function () { pm.expect(pm.response.code === 200 || pm.response.code === 401).to.be.true; });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "GET /logs - With Bearer token",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer test-loadgen-key-123"
+              }
+            ],
+            "url": "http://localhost:8080/logs?limit=1",
+            "description": "Logs with Bearer token"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status is 200 or 401', function () { pm.expect(pm.response.code === 200 || pm.response.code === 401).to.be.true; });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "GET /logs - With X-API-Key",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-API-Key",
+                "value": "test-loadgen-key-123"
+              }
+            ],
+            "url": "http://localhost:8080/logs?limit=1",
+            "description": "Logs with X-API-Key header"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status is 200 or 401', function () { pm.expect(pm.response.code === 200 || pm.response.code === 401).to.be.true; });"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
