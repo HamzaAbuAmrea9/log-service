@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: TypeScript compilation
+        run: npm run build
+
+      - name: Run unit tests
+        run: npm test
+
+      - name: Build Docker images
+        run: docker compose build
+
+      - name: Start services
+        run: docker compose up -d
+
+      - name: Wait for health check
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8080/health > /dev/null 2>&1; then
+              echo "Service is healthy"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Service failed to become healthy"
+          docker compose logs
+          exit 1
+
+      - name: Smoke test - POST /logs
+        run: |
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST http://localhost:8080/logs \
+            -H "Content-Type: application/json" \
+            -d '{"logs":[{"timestamp":"2026-08-09T12:00:00Z","level":"info","service":"test","message":"smoke test"}]}')
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | head -n -1)
+          echo "POST /logs: $HTTP_CODE $BODY"
+          [ "$HTTP_CODE" = "200" ]
+
+      - name: Smoke test - GET /logs
+        run: |
+          RESPONSE=$(curl -s -w "\n%{http_code}" "http://localhost:8080/logs?limit=1")
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | head -n -1)
+          echo "GET /logs: $HTTP_CODE $BODY"
+          [ "$HTTP_CODE" = "200" ]
+
+      - name: Smoke test - GET /logs/aggregate
+        run: |
+          RESPONSE=$(curl -s -w "\n%{http_code}" "http://localhost:8080/logs/aggregate?since=2026-08-09T00:00:00Z&until=2026-08-10T00:00:00Z&bucket=1h")
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | head -n -1)
+          echo "GET /logs/aggregate: $HTTP_CODE $BODY"
+          [ "$HTTP_CODE" = "200" ]
+
+      - name: Smoke test - malformed JSON returns 400
+        run: |
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:8080/logs \
+            -H "Content-Type: application/json" \
+            -d 'not json')
+          echo "Malformed JSON: $HTTP_CODE"
+          [ "$HTTP_CODE" = "400" ]
+
+      - name: Smoke test - invalid level returns 400
+        run: |
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:8080/logs \
+            -H "Content-Type: application/json" \
+            -d '{"logs":[{"timestamp":"2026-08-09T12:00:00Z","level":"critical","service":"test","message":"bad level"}]}')
+          echo "Invalid level: $HTTP_CODE"
+          [ "$HTTP_CODE" = "400" ]
+
+      - name: Smoke test - invalid query param returns 400
+        run: |
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:8080/logs?level=invalid")
+          echo "Invalid level query: $HTTP_CODE"
+          [ "$HTTP_CODE" = "400" ]
+
+      - name: Collect logs on failure
+        if: failure()
+        run: docker compose logs
+
+      - name: Stop services
+        if: always()
+        run: docker compose down
