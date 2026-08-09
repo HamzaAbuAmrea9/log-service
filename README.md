@@ -238,7 +238,18 @@ npm test
 node load-test.js
 ```
 
-Sends 50K logs in batches of 1000 with 10 concurrent requests, then benchmarks all query endpoints.
+**Methodology:**
+- 50,000 logs total (50 batches × 1,000 logs per batch)
+- 10 concurrent requests (parallel ingestion)
+- Each log has: random timestamp (30-day range), random level, random service, random message, attributes with user_id
+- Warm-up: 1 batch sent before timing begins
+- Timing: only the 50 batches are timed (not warm-up)
+- Query benchmark: 10 iterations per query type, sorted, P50/P95/P99 reported
+- All tests hit the same running instance (no restart between ingest and query)
+
+**What is measured:**
+- Ingestion: total time, logs/sec, error count
+- Queries: P50 (median), P95, P99 latency for each filter type
 
 ### CI Pipeline
 The pipeline runs:
