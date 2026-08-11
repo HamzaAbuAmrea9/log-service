@@ -31,7 +31,8 @@ jobs:
       - name: Build Docker images
         run: docker compose build
 
-      - name: Start services
+      # Config 1: AUTH_ENABLED=false (default)
+      - name: Start services (auth disabled)
         run: docker compose up -d
 
       - name: Wait for health check
@@ -47,7 +48,7 @@ jobs:
           docker compose logs
           exit 1
 
-      - name: Smoke test - POST /logs
+      - name: Smoke test - POST /logs (no auth)
         run: |
           RESPONSE=$(curl -s -w "\n%{http_code}" -X POST http://localhost:8080/logs \
             -H "Content-Type: application/json" \
@@ -57,7 +58,7 @@ jobs:
           echo "POST /logs: $HTTP_CODE $BODY"
           [ "$HTTP_CODE" = "200" ]
 
-      - name: Smoke test - GET /logs
+      - name: Smoke test - GET /logs (no auth)
         run: |
           RESPONSE=$(curl -s -w "\n%{http_code}" "http://localhost:8080/logs?limit=1")
           HTTP_CODE=$(echo "$RESPONSE" | tail -1)
@@ -65,7 +66,7 @@ jobs:
           echo "GET /logs: $HTTP_CODE $BODY"
           [ "$HTTP_CODE" = "200" ]
 
-      - name: Smoke test - GET /logs/aggregate
+      - name: Smoke test - GET /logs/aggregate (no auth)
         run: |
           RESPONSE=$(curl -s -w "\n%{http_code}" "http://localhost:8080/logs/aggregate?since=2026-08-09T00:00:00Z&until=2026-08-10T00:00:00Z&bucket=1h")
           HTTP_CODE=$(echo "$RESPONSE" | tail -1)
@@ -94,6 +95,102 @@ jobs:
           HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:8080/logs?level=invalid")
           echo "Invalid level query: $HTTP_CODE"
           [ "$HTTP_CODE" = "400" ]
+
+      - name: Smoke test - all invalid entries returns 400
+        run: |
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST http://localhost:8080/logs \
+            -H "Content-Type: application/json" \
+            -d '{"logs":[{"timestamp":"2026-08-09T12:00:00Z","level":"critical","service":"test","message":"bad"}]}')
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          echo "All invalid: $HTTP_CODE"
+          [ "$HTTP_CODE" = "400" ]
+
+      - name: Stop services (auth disabled)
+        run: docker compose down
+
+      # Config 2: AUTH_ENABLED=true with LOADGEN_API_KEY
+      - name: Start services (auth enabled)
+        run: |
+          docker compose up -d \
+            -e AUTH_ENABLED=true \
+            -e LOADGEN_API_KEY=test-loadgen-key-123
+
+      - name: Wait for health check (auth enabled)
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8080/health > /dev/null 2>&1; then
+              echo "Service is healthy (auth enabled)"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Service failed to become healthy (auth enabled)"
+          docker compose logs
+          exit 1
+
+      - name: Smoke test - POST /logs with valid bearer token
+        run: |
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST http://localhost:8080/logs \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer test-loadgen-key-123" \
+            -d '{"logs":[{"timestamp":"2026-08-09T12:00:00Z","level":"info","service":"test","message":"auth test"}]}')
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | head -n -1)
+          echo "POST /logs (auth): $HTTP_CODE $BODY"
+          [ "$HTTP_CODE" = "200" ]
+
+      - name: Smoke test - GET /logs with valid bearer token
+        run: |
+          RESPONSE=$(curl -s -w "\n%{http_code}" "http://localhost:8080/logs?limit=1" \
+            -H "Authorization: Bearer test-loadgen-key-123")
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | head -n -1)
+          echo "GET /logs (auth): $HTTP_CODE $BODY"
+          [ "$HTTP_CODE" = "200" ]
+
+      - name: Smoke test - GET /logs/aggregate with valid bearer token
+        run: |
+          RESPONSE=$(curl -s -w "\n%{http_code}" "http://localhost:8080/logs/aggregate?since=2026-08-09T00:00:00Z&until=2026-08-10T00:00:00Z&bucket=1h" \
+            -H "Authorization: Bearer test-loadgen-key-123")
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | head -n -1)
+          echo "GET /logs/aggregate (auth): $HTTP_CODE $BODY"
+          [ "$HTTP_CODE" = "200" ]
+
+      - name: Smoke test - POST /logs without token returns 401
+        run: |
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:8080/logs \
+            -H "Content-Type: application/json" \
+            -d '{"logs":[{"timestamp":"2026-08-09T12:00:00Z","level":"info","service":"test","message":"no auth"}]}')
+          echo "POST /logs (no auth): $HTTP_CODE"
+          [ "$HTTP_CODE" = "401" ]
+
+      - name: Smoke test - GET /logs without token returns 401
+        run: |
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:8080/logs?limit=1")
+          echo "GET /logs (no auth): $HTTP_CODE"
+          [ "$HTTP_CODE" = "401" ]
+
+      - name: Smoke test - GET /logs/aggregate without token returns 401
+        run: |
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:8080/logs/aggregate?since=2026-08-09T00:00:00Z&until=2026-08-10T00:00:00Z&bucket=1h")
+          echo "GET /logs/aggregate (no auth): $HTTP_CODE"
+          [ "$HTTP_CODE" = "401" ]
+
+      - name: Smoke test - health always unauthenticated
+        run: |
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:8080/health")
+          echo "GET /health (auth enabled, no token): $HTTP_CODE"
+          [ "$HTTP_CODE" = "200" ]
+
+      - name: Smoke test - POST /logs with invalid token returns 401
+        run: |
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:8080/logs \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer wrong-key" \
+            -d '{"logs":[{"timestamp":"2026-08-09T12:00:00Z","level":"info","service":"test","message":"bad auth"}]}')
+          echo "POST /logs (bad token): $HTTP_CODE"
+          [ "$HTTP_CODE" = "401" ]
 
       - name: Collect logs on failure
         if: failure()
