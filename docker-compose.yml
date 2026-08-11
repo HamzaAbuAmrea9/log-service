@@ -9,8 +9,8 @@ services:
       postgres
         -c shared_buffers=256MB
         -c effective_cache_size=512MB
-        -c work_mem=4MB
-        -c maintenance_work_mem=64MB
+        -c work_mem=16MB
+        -c maintenance_work_mem=128MB
         -c wal_buffers=16MB
         -c checkpoint_completion_target=0.9
         -c max_wal_size=1GB
@@ -19,7 +19,9 @@ services:
         -c full_page_writes=off
         -c random_page_cost=1.1
         -c effective_io_concurrency=200
-        -c max_connections=50
+        -c max_connections=100
+        -c default_statistics_target=100
+        -c jit=off
     ports:
       - "5433:5432"
     volumes:
@@ -45,7 +47,7 @@ services:
       RETENTION_DAYS: "30"
       AUTH_ENABLED: "false"
       RATE_LIMIT_ENABLED: "false"
-      POOL_SIZE: "20"
+      POOL_SIZE: "30"
     depends_on:
       postgres:
         condition: service_healthy
