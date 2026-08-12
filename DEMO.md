@@ -4,8 +4,8 @@
 
 ### High-Level Flow
 ```
-Client → Fastify (8080) → Validation → Write Buffer → PostgreSQL
-                                        ↓ (async 5ms flush, 1000 rows/batch)
+Client → Fastify (8080) → Validation → COPY FROM STDIN → PostgreSQL
+                                        ↓ (1000 rows/batch, INSERT fallback)
 Client ← Fastify ← Query Builder ← PostgreSQL (parameterized queries)
 ```
 
@@ -20,7 +20,7 @@ src/
 │   ├── logs.ts       ← POST /logs + GET /logs (validation, parsing, attr.* handling)
 │   └── aggregate.ts  ← GET /logs/aggregate (date_bin, group_by)
 ├── services/
-│   ├── ingest.ts     ← Write buffer with micro-batching (5ms flush, 1000 rows/batch)
+│   ├── ingest.ts     ← COPY FROM STDIN bulk writes (1000 rows/batch, INSERT fallback)
 │   ├── query.ts      ← Dynamic query builder, cursor pagination
 │   ├── aggregate.ts  ← date_bin bucketing, dynamic group_by
 │   ├── auth.ts       ← API key auth (off by default), Bearer + X-API-Key
@@ -39,9 +39,9 @@ src/
 |----------|-----|-----------|
 | **Level as SMALLINT** | Saves 3 bytes/row vs VARCHAR, faster comparisons/indexes | Requires LEVEL_NAMES mapping in query.ts:96 |
 | **JSONB for attributes** | Flexible schema, GIN index for fast equality lookups | GIN index build time ~30s for 1M rows, ~200MB RAM |
-| **Micro-batching (5ms)** | Reduces round-trips by 1000x, sustains 35K+ logs/sec | Small added latency (5ms max) per batch |
+| **COPY FROM STDIN (1000 rows)** | ~2-3x faster than multi-row INSERT; single durable statement | Requires text-format escaping of fields |
 | **Cursor pagination** | O(1) performance regardless of page depth vs OFFSET O(n) | More complex implementation |
-| **Buffered ingestion** | High throughput via batched INSERTs | Risk: returns 200 before flush completes |
+| **Durable writes (COPY/INSERT)** | Every accepted log is committed before the 200 is returned | Slightly lower ceiling than fire-and-forget buffering |
 | **synchronous_commit=off** | Major throughput boost for writes | Data loss risk on PG crash (acceptable for log data) |
 | **full_page_writes=off** | Further write performance boost | Recovery may need more WAL replay |
 | **GIN trigram on message** | Enables ILIKE substring search without sequential scan | ~200MB index memory, tight with 1GB PG RAM |
@@ -151,15 +151,14 @@ LIMIT 100;
       → Checks: timestamp (ISO 8601, not >5min future), level, service, message, attributes
    c. Filters valid/invalid entries
    d. If all invalid → 400 with {accepted:0, rejected:[...]}
-4. ingestLogs(validEntries) — ingest.ts:32-57
-   a. If <10 entries → directInsert() (waits for INSERT)
-   b. If ≥10 entries → buffered path:
-      → Adds to buffer array
-      → scheduleFlush() sets 5ms timer
-      → Returns {accepted: N} immediately
-   c. flushBuffer() — ingest.ts:59-114
-      → Batch INSERT with 1000 rows/batch
-      → pool.query(query, values.flat())
+4. ingestLogs(validEntries) — ingest.ts
+   a. Splits entries into 1000-row batches
+   b. copyBatch(batch) — streams COPY text format via pg-copy-streams
+      → COPY logs (timestamp, level, service, message, attributes) FROM STDIN
+      → text fields escaped for tab/newline/backslash
+   c. If COPY fails (e.g., COPY protocol unavailable) → insertBatch()
+      → multi-row INSERT with 1000 rows/batch, pool.query(query, values.flat())
+   d. Every accepted log is durable before the response is returned
 5. Returns {accepted: N, rejected: [...]}
 ```
 
@@ -362,8 +361,8 @@ docker compose down
 | Metric | Value |
 |--------|-------|
 | Ingestion rate | ~35,000 logs/sec sustained |
-| Batch size | 1,000 rows per INSERT |
-| Flush interval | 5ms micro-batching |
+| Batch size | 1,000 rows per COPY / INSERT |
+| Write path | COPY FROM STDIN (multi-row INSERT fallback) |
 | Connection pool | 20 connections |
 | Cursor pagination | ~0.3ms regardless of page depth |
 | Aggregation (1h buckets) | ~15ms on 100K rows |

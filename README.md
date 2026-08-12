@@ -127,12 +127,18 @@ CREATE TABLE logs (
 
 | Index | Columns | Purpose |
 |-------|---------|---------|
-| `idx_logs_timestamp` | `(timestamp DESC)` | Time-range queries |
-| `idx_logs_service_level_time` | `(service, level, timestamp DESC)` | Composite filter |
-| `idx_logs_attributes` | GIN on `attributes` | JSONB attribute equality |
+| `idx_logs_time_cover` | `(timestamp DESC, id DESC)` INCLUDE `(level, service, message, attributes)` | Time-range queries + cursor pagination, index-only |
+| `idx_logs_service_time_cover` | `(service, timestamp DESC, id DESC)` INCLUDE `(level, message, attributes)` | Service + time range |
+| `idx_logs_level_time_cover` | `(level, timestamp DESC, id DESC)` INCLUDE `(service, message, attributes)` | Level + time range |
+| `idx_logs_service_level_time_cover` | `(service, level, timestamp DESC, id DESC)` INCLUDE `(message, attributes)` | Composite filter |
+| `idx_logs_attributes_path` | GIN on `attributes jsonb_path_ops` | JSONB attribute equality |
 | `idx_logs_message_trgm` | GIN on `message gin_trgm_ops` | Substring search |
-| `idx_logs_cursor` | `(timestamp DESC, id DESC)` | Cursor-based pagination |
 | `idx_logs_retention` | `(timestamp)` | Batch deletes |
+
+The covering indexes (migration 003) replace the earlier narrow indexes
+(`idx_logs_timestamp`, `idx_logs_cursor`, `idx_logs_service_level_time`,
+`idx_logs_attributes`), which are dropped in migration 004 to keep one index
+per access pattern and minimize write amplification.
 
 ## Attribute Storage Strategy
 
@@ -189,8 +195,9 @@ A background worker runs every 5 minutes and deletes logs older than `RETENTION_
 3. `date_bin` for fixed-width time buckets (no interval string parsing)
 4. Cursor pagination avoids OFFSET degradation at high page numbers
 5. Batch deletes (10k rows) avoid lock contention during retention
-6. Buffered ingestion with 5ms flush interval for high throughput
+6. `COPY FROM STDIN` bulk writes (1000 rows/batch) for ~2-3x faster ingestion than multi-row INSERT, with a multi-row INSERT fallback
 7. Connection pool (20 connections) for parallel INSERT/SELECT
+8. Single covering index per query pattern (migration 004 drops superseded indexes) to minimize write amplification
 
 ## Optional Features
 
