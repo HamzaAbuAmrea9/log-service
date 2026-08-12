@@ -109,11 +109,12 @@ jobs:
         run: docker compose down
 
       # Config 2: AUTH_ENABLED=true with LOADGEN_API_KEY
+      # NOTE: `docker compose up` has no -e flag (that is `run`-only). The compose
+      # file interpolates ${AUTH_ENABLED}/${LOADGEN_API_KEY} from the process env,
+      # so we export them for the command instead.
       - name: Start services (auth enabled)
         run: |
-          docker compose up -d \
-            -e AUTH_ENABLED=true \
-            -e LOADGEN_API_KEY=test-loadgen-key-123
+          AUTH_ENABLED=true LOADGEN_API_KEY=test-loadgen-key-123 docker compose up -d
 
       - name: Wait for health check (auth enabled)
         run: |

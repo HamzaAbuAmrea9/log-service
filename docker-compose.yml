@@ -48,8 +48,9 @@ services:
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/logs?sslmode=disable
       PORT: "8080"
       RETENTION_DAYS: "30"
-      AUTH_ENABLED: "false"
-      RATE_LIMIT_ENABLED: "false"
+      AUTH_ENABLED: "${AUTH_ENABLED:-false}"
+      LOADGEN_API_KEY: "${LOADGEN_API_KEY:-}"
+      RATE_LIMIT_ENABLED: "${RATE_LIMIT_ENABLED:-false}"
       POOL_SIZE: "20"
     depends_on:
       postgres:
