@@ -52,7 +52,10 @@ export interface ValidationError {
 
 const VALID_LEVELS = new Set(["debug", "info", "warn", "error"]);
 
-export function validateLogEntry(entry: unknown, index: number): ValidationError | null {
+export function validateLogEntry(
+  entry: unknown,
+  index: number,
+): ValidationError | null {
   if (typeof entry !== "object" || entry === null) {
     return { index, reason: "entry must be an object" };
   }
@@ -69,7 +72,10 @@ export function validateLogEntry(entry: unknown, index: number): ValidationError
   }
   const fiveMinFromNow = Date.now() + 5 * 60 * 1000;
   if (ts.getTime() > fiveMinFromNow) {
-    return { index, reason: "timestamp must not be more than five minutes in the future" };
+    return {
+      index,
+      reason: "timestamp must not be more than five minutes in the future",
+    };
   }
 
   // level
@@ -78,24 +84,41 @@ export function validateLogEntry(entry: unknown, index: number): ValidationError
   }
 
   // service
-  if (typeof obj.service !== "string" || obj.service.length === 0) {
-    return { index, reason: "service is required and must be a non-empty string" };
+  if (typeof obj.service !== "string" || obj.service.trim().length === 0) {
+    return {
+      index,
+      reason: "service is required and must be a non-empty string",
+    };
   }
 
   // message
-  if (typeof obj.message !== "string" || obj.message.length === 0) {
-    return { index, reason: "message is required and must be a non-empty string" };
+  if (typeof obj.message !== "string" || obj.message.trim().length === 0) {
+    return {
+      index,
+      reason: "message is required and must be a non-empty string",
+    };
   }
 
   // attributes (optional)
   if (obj.attributes !== undefined) {
-    if (typeof obj.attributes !== "object" || obj.attributes === null || Array.isArray(obj.attributes)) {
+    if (
+      typeof obj.attributes !== "object" ||
+      obj.attributes === null ||
+      Array.isArray(obj.attributes)
+    ) {
       return { index, reason: "attributes must be a flat object" };
     }
     const attrs = obj.attributes as Record<string, unknown>;
     for (const [key, val] of Object.entries(attrs)) {
-      if (typeof val !== "string" && typeof val !== "number" && typeof val !== "boolean") {
-        return { index, reason: `attribute '${key}' must be a string, number, or boolean` };
+      if (
+        typeof val !== "string" &&
+        typeof val !== "number" &&
+        typeof val !== "boolean"
+      ) {
+        return {
+          index,
+          reason: `attribute '${key}' must be a string, number, or boolean`,
+        };
       }
     }
   }

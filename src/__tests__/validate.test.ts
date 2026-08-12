@@ -1,5 +1,10 @@
 import { describe, it, expect } from "vitest";
-import { validateLogEntry, validateBatch, LEVEL_MAP, LEVEL_NAMES } from "../utils/validate.js";
+import {
+  validateLogEntry,
+  validateBatch,
+  LEVEL_MAP,
+  LEVEL_NAMES,
+} from "../utils/validate.js";
 import { encodeCursor, decodeCursor } from "../utils/cursor.js";
 
 describe("validateLogEntry", () => {
@@ -21,18 +26,32 @@ describe("validateLogEntry", () => {
   });
 
   it("rejects non-object", () => {
-    expect(validateLogEntry(null, 0)).toEqual({ index: 0, reason: "entry must be an object" });
-    expect(validateLogEntry("string", 0)).toEqual({ index: 0, reason: "entry must be an object" });
-    expect(validateLogEntry(42, 0)).toEqual({ index: 0, reason: "entry must be an object" });
+    expect(validateLogEntry(null, 0)).toEqual({
+      index: 0,
+      reason: "entry must be an object",
+    });
+    expect(validateLogEntry("string", 0)).toEqual({
+      index: 0,
+      reason: "entry must be an object",
+    });
+    expect(validateLogEntry(42, 0)).toEqual({
+      index: 0,
+      reason: "entry must be an object",
+    });
   });
 
   it("rejects missing timestamp", () => {
     const { timestamp: _, ...noTs } = validEntry;
-    expect(validateLogEntry(noTs, 0)).toEqual({ index: 0, reason: "timestamp is required and must be a string" });
+    expect(validateLogEntry(noTs, 0)).toEqual({
+      index: 0,
+      reason: "timestamp is required and must be a string",
+    });
   });
 
   it("rejects invalid timestamp format", () => {
-    expect(validateLogEntry({ ...validEntry, timestamp: "not-a-date" }, 0)).toEqual({
+    expect(
+      validateLogEntry({ ...validEntry, timestamp: "not-a-date" }, 0),
+    ).toEqual({
       index: 0,
       reason: "invalid timestamp format",
     });
@@ -48,7 +67,9 @@ describe("validateLogEntry", () => {
 
   it("accepts timestamp within 5 minutes in the future", () => {
     const nearFuture = new Date(Date.now() + 4 * 60 * 1000).toISOString();
-    expect(validateLogEntry({ ...validEntry, timestamp: nearFuture }, 0)).toBeNull();
+    expect(
+      validateLogEntry({ ...validEntry, timestamp: nearFuture }, 0),
+    ).toBeNull();
   });
 
   it("rejects invalid level", () => {
@@ -75,6 +96,13 @@ describe("validateLogEntry", () => {
     });
   });
 
+  it("rejects whitespace-only service", () => {
+    expect(validateLogEntry({ ...validEntry, service: "   " }, 0)).toEqual({
+      index: 0,
+      reason: "service is required and must be a non-empty string",
+    });
+  });
+
   it("rejects non-string service", () => {
     expect(validateLogEntry({ ...validEntry, service: 123 }, 0)).toEqual({
       index: 0,
@@ -89,6 +117,13 @@ describe("validateLogEntry", () => {
     });
   });
 
+  it("rejects whitespace-only message", () => {
+    expect(validateLogEntry({ ...validEntry, message: "   " }, 0)).toEqual({
+      index: 0,
+      reason: "message is required and must be a non-empty string",
+    });
+  });
+
   it("rejects non-string message", () => {
     expect(validateLogEntry({ ...validEntry, message: 123 }, 0)).toEqual({
       index: 0,
@@ -97,38 +132,70 @@ describe("validateLogEntry", () => {
   });
 
   it("rejects nested attributes", () => {
-    expect(validateLogEntry({ ...validEntry, attributes: { nested: { deep: true } } }, 0)).toEqual({
+    expect(
+      validateLogEntry(
+        { ...validEntry, attributes: { nested: { deep: true } } },
+        0,
+      ),
+    ).toEqual({
       index: 0,
       reason: "attribute 'nested' must be a string, number, or boolean",
     });
   });
 
   it("rejects array attributes", () => {
-    expect(validateLogEntry({ ...validEntry, attributes: [1, 2, 3] }, 0)).toEqual({
+    expect(
+      validateLogEntry({ ...validEntry, attributes: [1, 2, 3] }, 0),
+    ).toEqual({
       index: 0,
       reason: "attributes must be a flat object",
     });
   });
 
   it("accepts boolean attribute values", () => {
-    expect(validateLogEntry({ ...validEntry, attributes: { flag: true, count: 42, name: "test" } }, 0)).toBeNull();
+    expect(
+      validateLogEntry(
+        { ...validEntry, attributes: { flag: true, count: 42, name: "test" } },
+        0,
+      ),
+    ).toBeNull();
   });
 });
 
 describe("validateBatch", () => {
   it("returns no errors for all valid entries", () => {
     const logs = [
-      { timestamp: "2026-07-20T14:00:00Z", level: "info", service: "a", message: "b" },
-      { timestamp: "2026-07-20T14:00:01Z", level: "error", service: "c", message: "d" },
+      {
+        timestamp: "2026-07-20T14:00:00Z",
+        level: "info",
+        service: "a",
+        message: "b",
+      },
+      {
+        timestamp: "2026-07-20T14:00:01Z",
+        level: "error",
+        service: "c",
+        message: "d",
+      },
     ];
     expect(validateBatch(logs)).toEqual([]);
   });
 
   it("returns errors for invalid entries", () => {
     const logs = [
-      { timestamp: "2026-07-20T14:00:00Z", level: "info", service: "a", message: "b" },
+      {
+        timestamp: "2026-07-20T14:00:00Z",
+        level: "info",
+        service: "a",
+        message: "b",
+      },
       { timestamp: "bad", level: "info", service: "c", message: "d" },
-      { timestamp: "2026-07-20T14:00:02Z", level: "critical", service: "e", message: "f" },
+      {
+        timestamp: "2026-07-20T14:00:02Z",
+        level: "critical",
+        service: "e",
+        message: "f",
+      },
     ];
     const errors = validateBatch(logs);
     expect(errors).toHaveLength(2);
@@ -164,16 +231,22 @@ describe("cursor", () => {
   });
 
   it("rejects invalid cursor", () => {
-    expect(() => decodeCursor("invalid")).toThrow("Invalid or malformed cursor");
+    expect(() => decodeCursor("invalid")).toThrow(
+      "Invalid or malformed cursor",
+    );
   });
 
   it("rejects cursor with missing fields", () => {
-    const bad = Buffer.from(JSON.stringify({ t: "2026-07-20T14:00:00Z" })).toString("base64url");
+    const bad = Buffer.from(
+      JSON.stringify({ t: "2026-07-20T14:00:00Z" }),
+    ).toString("base64url");
     expect(() => decodeCursor(bad)).toThrow("Invalid or malformed cursor");
   });
 
   it("rejects cursor with invalid timestamp", () => {
-    const bad = Buffer.from(JSON.stringify({ t: "not-a-date", i: 1 })).toString("base64url");
+    const bad = Buffer.from(JSON.stringify({ t: "not-a-date", i: 1 })).toString(
+      "base64url",
+    );
     expect(() => decodeCursor(bad)).toThrow("Invalid or malformed cursor");
   });
 });
