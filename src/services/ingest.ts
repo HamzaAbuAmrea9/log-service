@@ -1,48 +1,9 @@
-import { Readable } from "stream";
-import { pipeline } from "stream/promises";
-import { from as copyFrom } from "pg-copy-streams";
 import { pool } from "../db.js";
 import { config } from "../config.js";
 import { LogEntry, LEVEL_MAP, IngestResult } from "../utils/validate.js";
 
-const COPY_BATCH_SIZE = 1000;
+const BATCH_SIZE = 1000;
 const FLUSH_CONCURRENCY = 8;
-
-// COPY text format: fields separated by tab, rows by newline.
-// Backslash, tab, newline, and carriage return must be escaped.
-function escapeCopyField(value: string): string {
-  return value
-    .replace(/\\/g, "\\\\")
-    .replace(/\t/g, "\\t")
-    .replace(/\n/g, "\\n")
-    .replace(/\r/g, "\\r");
-}
-
-function toCopyRow(entry: LogEntry): string {
-  return [
-    entry.timestamp,
-    String(LEVEL_MAP[entry.level]),
-    entry.service,
-    entry.message,
-    JSON.stringify(entry.attributes || {}),
-  ]
-    .map(escapeCopyField)
-    .join("\t") + "\n";
-}
-
-// COPY FROM STDIN is the fastest bulk write path in PostgreSQL (2-3x
-// faster than multi-row INSERT at the same batch size).
-async function copyBatch(batch: LogEntry[]): Promise<void> {
-  const client = await pool.connect();
-  try {
-    const ingestStream = client.query(
-      copyFrom("COPY logs (timestamp, level, service, message, attributes) FROM STDIN"),
-    );
-    await pipeline(Readable.from(batch.map(toCopyRow)), ingestStream);
-  } finally {
-    client.release();
-  }
-}
 
 async function insertBatch(batch: LogEntry[]): Promise<void> {
   const values: unknown[][] = [];
@@ -75,23 +36,17 @@ async function insertBatch(batch: LogEntry[]): Promise<void> {
 }
 
 // Writes chunks in parallel (bounded concurrency) so a large request
-// finishes in ~one COPY time instead of N sequential round-trips.
+// finishes in ~one batch time instead of N sequential round-trips.
 async function writeChunks(entries: LogEntry[]): Promise<void> {
   const chunks: LogEntry[][] = [];
-  for (let i = 0; i < entries.length; i += COPY_BATCH_SIZE) {
-    chunks.push(entries.slice(i, i + COPY_BATCH_SIZE));
+  for (let i = 0; i < entries.length; i += BATCH_SIZE) {
+    chunks.push(entries.slice(i, i + BATCH_SIZE));
   }
 
   let next = 0;
   const workers = Array.from({ length: Math.min(FLUSH_CONCURRENCY, chunks.length) }, async () => {
     while (next < chunks.length) {
-      const chunk = chunks[next++];
-      try {
-        await copyBatch(chunk);
-      } catch {
-        // Fallback to multi-row INSERT if COPY is unavailable.
-        await insertBatch(chunk);
-      }
+      await insertBatch(chunks[next++]);
     }
   });
 

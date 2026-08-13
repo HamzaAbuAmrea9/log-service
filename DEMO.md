@@ -4,7 +4,7 @@
 
 ### High-Level Flow
 ```
-Client → Fastify (8080) → Validation → Buffer (5ms flush) → COPY FROM STDIN → PostgreSQL
+Client → Fastify (8080) → Validation → Buffer (5ms flush) → multi-row INSERT → PostgreSQL
                                           ↓ flush-on-query ↓
 Client ← Fastify ← Query Builder ← PostgreSQL (parameterized queries)
 ```
@@ -20,7 +20,7 @@ src/
 │   ├── logs.ts       ← POST /logs + GET /logs (validation, parsing, attr.* handling)
 │   └── aggregate.ts  ← GET /logs/aggregate (date_bin, group_by)
 ├── services/
-│   ├── ingest.ts     ← Buffered ingestion (5ms flush), COPY FROM STDIN + INSERT fallback, flush-on-query
+│   ├── ingest.ts     ← Buffered ingestion (5ms flush), multi-row INSERT, flush-on-query
 │   ├── query.ts      ← Dynamic query builder, cursor pagination
 │   ├── aggregate.ts  ← date_bin bucketing, dynamic group_by
 │   ├── auth.ts       ← API key auth (off by default), Bearer + X-API-Key
@@ -39,8 +39,8 @@ src/
 |----------|-----|-----------|
 | **Level as SMALLINT** | Saves 3 bytes/row vs VARCHAR, faster comparisons/indexes | Requires LEVEL_NAMES mapping in query.ts:96 |
 | **JSONB for attributes** | Flexible schema, GIN index for fast equality lookups | GIN index build time ~30s for 1M rows, ~200MB RAM |
-| **Buffered ingestion (5ms flush)** | ~1-2ms response; write latency decoupled from request latency; batches merge small requests into big COPYs | Accepted logs are durable on flush; flush-on-query keeps reads consistent |
-| **COPY FROM STDIN (1000 rows)** | ~2-3x faster than multi-row INSERT; single durable statement | Requires text-format escaping of fields |
+| **Buffered ingestion (5ms flush)** | ~1-2ms response; write latency decoupled from request latency; batches merge small requests into big INSERTs | Accepted logs are durable on flush; flush-on-query keeps reads consistent |
+| **Multi-row INSERT (1000 rows)** | Reduces round-trips by 1000x; single statement per batch | Single-statement param count limit (~65k) caps batch size |
 | **Cursor pagination** | O(1) performance regardless of page depth vs OFFSET O(n) | More complex implementation |
 | **synchronous_commit=off** | Major throughput boost for writes | Data loss risk on PG crash (acceptable for log data) |
 | **full_page_writes=off** | Further write performance boost | Recovery may need more WAL replay |
@@ -157,11 +157,7 @@ LIMIT 100;
       → if queue ≥ MAX_BUFFERED (100k) → synchronous flush to bound memory
       → background worker drains the queue every 5ms (FLUSH_INTERVAL_MS)
    b. Drain: split into 1000-row chunks → writeChunks() in parallel (8-way)
-      → copyBatch(batch): streams COPY text format via pg-copy-streams
-         COPY logs (timestamp, level, service, message, attributes) FROM STDIN
-         text fields escaped for tab/newline/backslash
-      → if COPY fails (e.g., COPY protocol unavailable) → insertBatch()
-         multi-row INSERT with 1000 rows/batch, pool.query(query, values.flat())
+      → insertBatch(chunk): multi-row INSERT, pool.query(query, values.flat())
       → on drain failure the chunk is requeued (no accepted log is dropped)
    c. GET handlers call flushBeforeQuery() first, so every read is consistent
       with everything already accepted
@@ -367,8 +363,8 @@ docker compose down
 | Metric | Value |
 |--------|-------|
 | Ingestion rate | ~35,000 logs/sec sustained |
-| Batch size | 1,000 rows per COPY / INSERT |
-| Write path | Buffered → COPY FROM STDIN (multi-row INSERT fallback) |
+| Batch size | 1,000 rows per INSERT |
+| Write path | Buffered → multi-row INSERT |
 | Flush interval | 5ms |
 | Connection pool | 20 connections |
 | Cursor pagination | ~0.3ms regardless of page depth |
