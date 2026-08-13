@@ -2,9 +2,11 @@ import { Readable } from "stream";
 import { pipeline } from "stream/promises";
 import { from as copyFrom } from "pg-copy-streams";
 import { pool } from "../db.js";
+import { config } from "../config.js";
 import { LogEntry, LEVEL_MAP, IngestResult } from "../utils/validate.js";
 
-const BATCH_SIZE = 1000;
+const COPY_BATCH_SIZE = 1000;
+const FLUSH_CONCURRENCY = 8;
 
 // COPY text format: fields separated by tab, rows by newline.
 // Backslash, tab, newline, and carriage return must be escaped.
@@ -72,26 +74,104 @@ async function insertBatch(batch: LogEntry[]): Promise<void> {
   await pool.query(query, values.flat());
 }
 
+// Writes chunks in parallel (bounded concurrency) so a large request
+// finishes in ~one COPY time instead of N sequential round-trips.
+async function writeChunks(entries: LogEntry[]): Promise<void> {
+  const chunks: LogEntry[][] = [];
+  for (let i = 0; i < entries.length; i += COPY_BATCH_SIZE) {
+    chunks.push(entries.slice(i, i + COPY_BATCH_SIZE));
+  }
+
+  let next = 0;
+  const workers = Array.from({ length: Math.min(FLUSH_CONCURRENCY, chunks.length) }, async () => {
+    while (next < chunks.length) {
+      const chunk = chunks[next++];
+      try {
+        await copyBatch(chunk);
+      } catch {
+        // Fallback to multi-row INSERT if COPY is unavailable.
+        await insertBatch(chunk);
+      }
+    }
+  });
+
+  await Promise.all(workers);
+}
+
+// ---------------------------------------------------------------------------
+// Buffered ingestion. POST /logs validates and enqueues; a worker drains the
+// queue every flushIntervalMs. GET handlers call flushBeforeQuery() so reads
+// are always consistent with everything already accepted. forceFlush() is
+// used on shutdown.
+// ---------------------------------------------------------------------------
+
+let queue: LogEntry[] = [];
+let flushing: Promise<void> = Promise.resolve();
+let interval: ReturnType<typeof setInterval> | null = null;
+
+async function drain(entries: LogEntry[]): Promise<void> {
+  try {
+    await writeChunks(entries);
+  } catch (err) {
+    // Requeue so accepted-but-uncommitted logs are not silently dropped.
+    queue.unshift(...entries);
+    throw err;
+  }
+}
+
+function flushAll(): Promise<void> {
+  const run = flushing.then(async () => {
+    const entries = queue.splice(0, queue.length);
+    if (entries.length > 0) {
+      await drain(entries);
+    }
+  });
+  flushing = run;
+  return run;
+}
+
+export function startFlushWorker(): void {
+  if (!config.bufferedIngest || interval) return;
+  console.log(`Flush worker started: every ${config.flushIntervalMs}ms`);
+  interval = setInterval(() => {
+    flushAll().catch((err) => console.error("Flush error:", err));
+  }, config.flushIntervalMs);
+}
+
+export function stopFlushWorker(): void {
+  if (interval) {
+    clearInterval(interval);
+    interval = null;
+  }
+}
+
+export async function forceFlush(): Promise<void> {
+  stopFlushWorker();
+  await flushAll();
+}
+
+export async function flushBeforeQuery(): Promise<void> {
+  if (!config.bufferedIngest) return;
+  await flushAll();
+}
+
 export async function ingestLogs(entries: LogEntry[]): Promise<IngestResult> {
   if (entries.length === 0) {
     return { accepted: 0, rejected: [] };
   }
 
-  for (let i = 0; i < entries.length; i += BATCH_SIZE) {
-    const batch = entries.slice(i, i + BATCH_SIZE);
+  if (config.bufferedIngest) {
+    queue.push(...entries);
 
-    try {
-      await copyBatch(batch);
-    } catch {
-      // Fallback to multi-row INSERT if COPY is unavailable
-      // (e.g., restricted environments without the COPY protocol).
-      await insertBatch(batch);
+    // Bound memory + keep latency flat: if the queue is too deep, flush
+    // synchronously so this request absorbs the cost.
+    if (queue.length >= config.maxBuffered) {
+      await flushAll();
     }
+
+    return { accepted: entries.length, rejected: [] };
   }
 
+  await writeChunks(entries);
   return { accepted: entries.length, rejected: [] };
-}
-
-export async function forceFlush(): Promise<void> {
-  // COPY and direct INSERT are already durable, so no-op is correct.
 }

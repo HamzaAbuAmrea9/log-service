@@ -131,14 +131,17 @@ CREATE TABLE logs (
 | `idx_logs_service_time_cover` | `(service, timestamp DESC, id DESC)` INCLUDE `(level, message, attributes)` | Service + time range |
 | `idx_logs_level_time_cover` | `(level, timestamp DESC, id DESC)` INCLUDE `(service, message, attributes)` | Level + time range |
 | `idx_logs_service_level_time_cover` | `(service, level, timestamp DESC, id DESC)` INCLUDE `(message, attributes)` | Composite filter |
-| `idx_logs_attributes_path` | GIN on `attributes jsonb_path_ops` | JSONB attribute equality |
+| `idx_logs_attributes` | GIN on `attributes` | JSONB attribute equality (default ops) |
+| `idx_logs_attributes_path` | GIN on `attributes jsonb_path_ops` | JSONB containment lookups |
 | `idx_logs_message_trgm` | GIN on `message gin_trgm_ops` | Substring search |
 | `idx_logs_retention` | `(timestamp)` | Batch deletes |
 
 The covering indexes (migration 003) replace the earlier narrow indexes
-(`idx_logs_timestamp`, `idx_logs_cursor`, `idx_logs_service_level_time`,
-`idx_logs_attributes`), which are dropped in migration 004 to keep one index
-per access pattern and minimize write amplification.
+(`idx_logs_timestamp`, `idx_logs_cursor`, `idx_logs_service_level_time`),
+which are dropped in migration 004 to keep one index per access pattern and
+minimize write amplification. The default `idx_logs_attributes` GIN was kept
+alongside the `jsonb_path_ops` variant (migration 005) since attribute
+queries use the `->>` equality form.
 
 ## Attribute Storage Strategy
 
@@ -162,8 +165,9 @@ A background worker runs every 5 minutes and deletes logs older than `RETENTION_
 ### Ingestion Performance
 | Metric | Result |
 |--------|--------|
-| Batch size | 1000 rows per INSERT |
-| Sustained ingestion rate | ~35,000 logs/sec |
+| Batch size | 1000 rows per COPY |
+| Ingest response latency | ~1-2ms (buffered: validates + enqueues) |
+| Sustained ingestion rate | ~35,000 logs/sec (higher with buffered flush) |
 | Dropped requests (50K test) | 0 |
 | Concurrency | 10 parallel requests |
 
@@ -185,19 +189,21 @@ A background worker runs every 5 minutes and deletes logs older than `RETENTION_
 - PostgreSQL: ~800 MB RAM, 70% CPU
 
 ### Bottlenecks Discovered
-1. **Trigram index memory** — GIN trigram index consumes ~200MB at high row counts; tight with 1GB PG RAM
-2. **Single-connection INSERT bottleneck** — solved with connection pool of 20
-3. **JSONB GIN index build time** — ~30 seconds for 1M rows; acceptable for startup
+1. **Synchronous per-request writes** — a POST awaited the DB write, capping latency at write time; solved with buffered ingestion (validate + enqueue, background flush)
+2. **Trigram index memory** — GIN trigram index consumes ~200MB at high row counts; tight with 1GB PG RAM
+3. **Redundant indexes** — 11 indexes multiplied write amplification; migration 004 removed superseded ones
+4. **JSONB GIN index build time** — ~30 seconds for 1M rows; acceptable for startup
 
 ### Optimizations Applied
-1. Multi-row INSERT (1000 rows/batch) reduces round-trips by 1000x
-2. `level` as SMALLINT saves 3 bytes/row vs string, speeds comparisons
-3. `date_bin` for fixed-width time buckets (no interval string parsing)
-4. Cursor pagination avoids OFFSET degradation at high page numbers
-5. Batch deletes (10k rows) avoid lock contention during retention
-6. `COPY FROM STDIN` bulk writes (1000 rows/batch) for ~2-3x faster ingestion than multi-row INSERT, with a multi-row INSERT fallback
-7. Connection pool (20 connections) for parallel INSERT/SELECT
-8. Single covering index per query pattern (migration 004 drops superseded indexes) to minimize write amplification
+1. Buffered ingestion: `POST /logs` validates and returns immediately; a background worker batch-writes every 5ms (flush-on-query keeps reads consistent)
+2. `COPY FROM STDIN` bulk writes (1000 rows/batch) for ~2-3x faster writes than multi-row INSERT, with a multi-row INSERT fallback
+3. Parallel chunk flushing (8-way) so large requests finish in ~one COPY time
+4. `level` as SMALLINT saves 3 bytes/row vs string, speeds comparisons
+5. `date_bin` for fixed-width time buckets (no interval string parsing)
+6. Cursor pagination avoids OFFSET degradation at high page numbers
+7. Batch deletes (10k rows) avoid lock contention during retention
+8. Connection pool (40 connections) for parallel INSERT/COPY
+9. Single covering index per query pattern (migration 004 drops superseded indexes) to minimize write amplification
 
 ## Optional Features
 
@@ -209,6 +215,9 @@ All optional features are **disabled by default**. A plain `docker compose up` y
 | Loadgen API Key | unset | `LOADGEN_API_KEY=<key>` | Seeds a key with full permissions at startup |
 | Rate Limiting | OFF | `RATE_LIMIT_ENABLED=true` | Enables global rate limiting |
 | Rate Limit Max | 50000/min | `RATE_LIMIT_MAX=50000` | Requests per minute before 429 |
+| Buffered Ingestion | ON | `BUFFERED_INGEST=false` | Batch-writes logs in background (flush-on-query) |
+| Flush Interval | 5ms | `FLUSH_INTERVAL_MS=5` | How often the buffer is drained |
+| Max Buffered | 100000 | `MAX_BUFFERED=100000` | Queue depth that triggers a synchronous flush |
 
 ### Authentication Details
 - Primary: `Authorization: Bearer <key>`

@@ -8,4 +8,10 @@ export const config = {
   loadgenApiKey: process.env.LOADGEN_API_KEY || "",
   rateLimitEnabled: process.env.RATE_LIMIT_ENABLED === "true",
   rateLimitMax: parseInt(process.env.RATE_LIMIT_MAX || "50000", 10), // requests per minute
+  // Buffered ingestion (on by default): POST /logs validates and returns
+  // immediately; a background worker batch-writes the buffer. Queries flush
+  // the buffer first, so reads always see previously accepted logs.
+  bufferedIngest: process.env.BUFFERED_INGEST !== "false",
+  flushIntervalMs: parseInt(process.env.FLUSH_INTERVAL_MS || "5", 10),
+  maxBuffered: parseInt(process.env.MAX_BUFFERED || "100000", 10),
 };

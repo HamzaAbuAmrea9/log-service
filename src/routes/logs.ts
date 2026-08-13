@@ -1,5 +1,5 @@
 import { FastifyInstance } from "fastify";
-import { ingestLogs } from "../services/ingest.js";
+import { ingestLogs, flushBeforeQuery } from "../services/ingest.js";
 import { queryLogs } from "../services/query.js";
 import { LogEntry, validateBatch, LEVEL_MAP } from "../utils/validate.js";
 
@@ -96,6 +96,9 @@ export async function logsRoutes(app: FastifyInstance): Promise<void> {
     }
 
     try {
+      // Ensure any buffered (not yet committed) logs are visible to reads.
+      await flushBeforeQuery();
+
       const result = await queryLogs({
         service: query.service,
         level: query.level,

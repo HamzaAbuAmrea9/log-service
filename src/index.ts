@@ -5,7 +5,7 @@ import { logsRoutes } from "./routes/logs.js";
 import { aggregateRoutes } from "./routes/aggregate.js";
 import { healthRoutes, markHealthy } from "./routes/health.js";
 import { startRetentionWorker } from "./services/retention.js";
-import { forceFlush } from "./services/ingest.js";
+import { forceFlush, startFlushWorker } from "./services/ingest.js";
 import { authMiddleware, seedLoadgenKey } from "./services/auth.js";
 import { rateLimitMiddleware } from "./services/ratelimit.js";
 
@@ -55,6 +55,9 @@ async function main(): Promise<void> {
 
   // Start retention worker
   startRetentionWorker();
+
+  // Start buffered-ingestion flush worker
+  startFlushWorker();
 
   // Start server
   await app.listen({ port: config.port, host: "0.0.0.0" });

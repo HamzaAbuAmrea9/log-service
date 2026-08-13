@@ -1,5 +1,6 @@
 import { FastifyInstance } from "fastify";
 import { aggregateLogs } from "../services/aggregate.js";
+import { flushBeforeQuery } from "../services/ingest.js";
 
 const VALID_LEVELS = new Set(["debug", "info", "warn", "error"]);
 const VALID_BUCKETS = new Set(["1m", "5m", "1h", "1d"]);
@@ -58,6 +59,9 @@ export async function aggregateRoutes(app: FastifyInstance): Promise<void> {
     }
 
     try {
+      // Ensure any buffered (not yet committed) logs are visible to reads.
+      await flushBeforeQuery();
+
       const buckets = await aggregateLogs({
         since: query.since,
         until: query.until,

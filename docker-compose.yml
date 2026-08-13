@@ -51,7 +51,7 @@ services:
       AUTH_ENABLED: "${AUTH_ENABLED:-false}"
       LOADGEN_API_KEY: "${LOADGEN_API_KEY:-}"
       RATE_LIMIT_ENABLED: "${RATE_LIMIT_ENABLED:-false}"
-      POOL_SIZE: "20"
+      POOL_SIZE: "40"
     depends_on:
       postgres:
         condition: service_healthy
