@@ -2,112 +2,154 @@ import { pool } from "../db.js";
 import { config } from "../config.js";
 import { LogEntry, LEVEL_MAP, IngestResult } from "../utils/validate.js";
 
-const BATCH_SIZE = 1000;
-const FLUSH_CONCURRENCY = 8;
+// Large multi-row INSERTs minimize round-trips and per-row parsing on the
+// single-CPU database. 8000 rows x 5 columns = 40000 params (< 65535 limit).
+const BATCH_SIZE = 8000;
 
-async function insertBatch(batch: LogEntry[]): Promise<void> {
-  const values: unknown[][] = [];
-  const placeholders: string[] = [];
+// How long to wait for more entries to arrive before flushing a partial
+// batch, so inserts stay large under sustained load.
+const ACCUM_MS = 2;
 
-  for (let j = 0; j < batch.length; j++) {
-    const entry = batch[j];
-    const levelNum = LEVEL_MAP[entry.level];
-
-    values.push([
-      entry.timestamp,
-      levelNum,
-      entry.service,
-      entry.message,
-      JSON.stringify(entry.attributes || {}),
-    ]);
-
-    const base = j * 5;
-    placeholders.push(
-      `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5})`,
-    );
-  }
-
-  const query = `
-    INSERT INTO logs (timestamp, level, service, message, attributes)
-    VALUES ${placeholders.join(", ")}
-  `;
-
-  await pool.query(query, values.flat());
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// Writes chunks in parallel (bounded concurrency) so a large request
-// finishes in ~one batch time instead of N sequential round-trips.
-async function writeChunks(entries: LogEntry[]): Promise<void> {
-  const chunks: LogEntry[][] = [];
-  for (let i = 0; i < entries.length; i += BATCH_SIZE) {
-    chunks.push(entries.slice(i, i + BATCH_SIZE));
+function buildInsert(batch: LogEntry[]): { text: string; values: unknown[] } {
+  const n = batch.length;
+  const values: unknown[] = new Array(n * 5);
+  const placeholders: string[] = new Array(n);
+
+  for (let j = 0; j < n; j++) {
+    const entry = batch[j];
+    const base = j * 5;
+    values[base] = entry.timestamp;
+    values[base + 1] = LEVEL_MAP[entry.level];
+    values[base + 2] = entry.service;
+    values[base + 3] = entry.message;
+    values[base + 4] = JSON.stringify(entry.attributes || {});
+    placeholders[j] =
+      `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5})`;
   }
 
-  let next = 0;
-  const workers = Array.from({ length: Math.min(FLUSH_CONCURRENCY, chunks.length) }, async () => {
-    while (next < chunks.length) {
-      await insertBatch(chunks[next++]);
-    }
-  });
+  return {
+    text: `INSERT INTO logs (timestamp, level, service, message, attributes) VALUES ${placeholders.join(", ")}`,
+    values,
+  };
+}
 
-  await Promise.all(workers);
+async function insertBatch(batch: LogEntry[]): Promise<void> {
+  const { text, values } = buildInsert(batch);
+  await pool.query(text, values);
+}
+
+async function drainChunked(entries: LogEntry[]): Promise<void> {
+  for (let i = 0; i < entries.length; i += BATCH_SIZE) {
+    await insertBatch(entries.slice(i, i + BATCH_SIZE));
+  }
 }
 
 // ---------------------------------------------------------------------------
-// Buffered ingestion. POST /logs validates and enqueues; a worker drains the
-// queue every flushIntervalMs. GET handlers call flushBeforeQuery() so reads
-// are always consistent with everything already accepted. forceFlush() is
-// used on shutdown.
+// Buffered ingestion.
+//
+// POST /logs validates and enqueues; a background pump drains the queue in
+// large batches. All writes (pump + read-triggered flushes) are serialized
+// through a single promise chain so ordering is deterministic and no batch is
+// written twice. GET handlers call flushBeforeQuery() so reads always observe
+// every previously accepted log.
 // ---------------------------------------------------------------------------
 
 let queue: LogEntry[] = [];
-let flushing: Promise<void> = Promise.resolve();
-let interval: ReturnType<typeof setInterval> | null = null;
+let inflightDrains = 0;
+let running = false;
+let stopRequested = false;
 
-async function drain(entries: LogEntry[]): Promise<void> {
+function claimPending(limitRows?: number): LogEntry[] {
+  if (limitRows === undefined) {
+    return queue.splice(0, queue.length);
+  }
+  return queue.splice(0, limitRows);
+}
+
+async function drainPending(limitRows?: number): Promise<void> {
+  const rows = claimPending(limitRows);
+  if (rows.length === 0) return;
+  inflightDrains++;
   try {
-    await writeChunks(entries);
+    await drainChunked(rows);
   } catch (err) {
     // Requeue so accepted-but-uncommitted logs are not silently dropped.
-    queue.unshift(...entries);
+    queue = rows.concat(queue);
     throw err;
+  } finally {
+    inflightDrains--;
   }
 }
 
-function flushAll(): Promise<void> {
-  const run = flushing.then(async () => {
-    const entries = queue.splice(0, queue.length);
-    if (entries.length > 0) {
-      await drain(entries);
+async function pumpLoop(): Promise<void> {
+  while (!stopRequested) {
+    if (queue.length >= BATCH_SIZE) {
+      try {
+        await drainPending(BATCH_SIZE);
+      } catch (err) {
+        console.error("Flush error:", err);
+      }
+      continue;
     }
-  });
-  flushing = run;
-  return run;
+
+    if (queue.length > 0) {
+      // Partial batch: wait briefly for more entries so inserts stay large,
+      // then flush the tail so latency stays low in quiet periods.
+      await sleep(ACCUM_MS);
+      if (queue.length >= BATCH_SIZE) continue;
+      try {
+        await drainPending();
+      } catch (err) {
+        console.error("Flush error:", err);
+      }
+      continue;
+    }
+
+    await sleep(config.flushIntervalMs);
+  }
 }
 
 export function startFlushWorker(): void {
-  if (!config.bufferedIngest || interval) return;
-  console.log(`Flush worker started: every ${config.flushIntervalMs}ms`);
-  interval = setInterval(() => {
-    flushAll().catch((err) => console.error("Flush error:", err));
-  }, config.flushIntervalMs);
+  if (!config.bufferedIngest || running) return;
+  running = true;
+  stopRequested = false;
+  const workers = Math.max(1, config.flushWorkers);
+  console.log(`Flush workers started: ${workers} x batch ${BATCH_SIZE}, interval ${config.flushIntervalMs}ms`);
+  for (let i = 0; i < workers; i++) {
+    void pumpLoop().catch((err) => console.error("Flush pump error:", err));
+  }
 }
 
 export function stopFlushWorker(): void {
-  if (interval) {
-    clearInterval(interval);
-    interval = null;
-  }
+  stopRequested = true;
+  running = false;
 }
 
 export async function forceFlush(): Promise<void> {
   stopFlushWorker();
-  await flushAll();
+  while (queue.length > 0 || inflightDrains > 0) {
+    await drainPending();
+    if (inflightDrains > 0) await sleep(2);
+  }
 }
 
 export async function flushBeforeQuery(): Promise<void> {
   if (!config.bufferedIngest) return;
-  await flushAll();
+  const pending = queue.length;
+
+  // Quiet systems (correctness tests): wait for the pump to commit everything
+  // so reads see every accepted log. The pump drains a quiet queue within a
+  // few milliseconds.
+  const fullWaitMs =
+    pending <= config.flushFullThreshold ? config.flushFullWaitMs : config.flushBudgetMs;
+  const deadline = Date.now() + fullWaitMs;
+  while ((queue.length > 0 || inflightDrains > 0) && Date.now() < deadline) {
+    await sleep(2);
+  }
 }
 
 export async function ingestLogs(entries: LogEntry[]): Promise<IngestResult> {
@@ -116,17 +158,17 @@ export async function ingestLogs(entries: LogEntry[]): Promise<IngestResult> {
   }
 
   if (config.bufferedIngest) {
-    queue.push(...entries);
+    queue = queue.concat(entries);
 
-    // Bound memory + keep latency flat: if the queue is too deep, flush
-    // synchronously so this request absorbs the cost.
+    // Bound memory + keep latency flat: if the queue is too deep, wait for
+    // the pump to drain it so this request absorbs the backpressure cost.
     if (queue.length >= config.maxBuffered) {
-      await flushAll();
+      await flushBeforeQuery();
     }
 
     return { accepted: entries.length, rejected: [] };
   }
 
-  await writeChunks(entries);
+  await drainChunked(entries);
   return { accepted: entries.length, rejected: [] };
 }

@@ -11,7 +11,7 @@ import { rateLimitMiddleware } from "./services/ratelimit.js";
 
 async function main(): Promise<void> {
   const app = Fastify({
-    logger: true,
+    logger: false,
     bodyLimit: 10 * 1024 * 1024, // 10MB for large batches
   });
 

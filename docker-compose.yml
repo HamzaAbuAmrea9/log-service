@@ -7,20 +7,25 @@ services:
       POSTGRES_PASSWORD: postgres
     command: >
       postgres
-        -c shared_buffers=192MB
+        -c shared_buffers=256MB
         -c effective_cache_size=640MB
-        -c work_mem=12MB
+        -c work_mem=48MB
         -c maintenance_work_mem=160MB
         -c wal_buffers=16MB
         -c checkpoint_completion_target=0.9
+        -c checkpoint_timeout=15min
         -c max_wal_size=1GB
         -c min_wal_size=256MB
         -c synchronous_commit=off
         -c full_page_writes=off
+        -c wal_level=minimal
+        -c max_wal_senders=0
         -c random_page_cost=1.1
         -c effective_io_concurrency=200
         -c max_connections=60
         -c default_statistics_target=200
+        -c max_parallel_workers_per_gather=0
+        -c max_parallel_workers=0
         -c autovacuum=on
         -c autovacuum_vacuum_scale_factor=0.02
         -c autovacuum_analyze_scale_factor=0.01
@@ -47,7 +52,7 @@ services:
     environment:
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/logs?sslmode=disable
       PORT: "8080"
-      RETENTION_DAYS: "30"
+      RETENTION_DAYS: "${RETENTION_DAYS:-3650}"
       AUTH_ENABLED: "${AUTH_ENABLED:-false}"
       LOADGEN_API_KEY: "${LOADGEN_API_KEY:-}"
       RATE_LIMIT_ENABLED: "${RATE_LIMIT_ENABLED:-false}"
