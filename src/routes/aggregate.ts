@@ -28,11 +28,11 @@ export async function aggregateRoutes(app: FastifyInstance): Promise<void> {
       return reply.status(400).send({ error: "Invalid 'until' timestamp" });
     }
 
-    // Validate until > since
+    // Validate until >= since (exclusive end, so an empty range is valid)
     const since = new Date(query.since).getTime();
     const until = new Date(query.until).getTime();
-    if (until <= since) {
-      return reply.status(400).send({ error: "'until' must be after 'since'" });
+    if (until < since) {
+      return reply.status(400).send({ error: "'until' must not be earlier than 'since'" });
     }
 
     // Validate bucket

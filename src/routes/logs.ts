@@ -58,8 +58,11 @@ export async function logsRoutes(app: FastifyInstance): Promise<void> {
     // Parse and validate limit
     let limit = DEFAULT_LIMIT;
     if (query.limit) {
+      if (!/^\d+$/.test(query.limit)) {
+        return reply.status(400).send({ error: `limit must be an integer between 1 and ${MAX_LIMIT}` });
+      }
       const parsed = parseInt(query.limit, 10);
-      if (isNaN(parsed) || parsed < 1 || parsed > MAX_LIMIT) {
+      if (parsed < 1 || parsed > MAX_LIMIT) {
         return reply.status(400).send({ error: `limit must be between 1 and ${MAX_LIMIT}` });
       }
       limit = parsed;
@@ -78,12 +81,12 @@ export async function logsRoutes(app: FastifyInstance): Promise<void> {
       return reply.status(400).send({ error: "Invalid 'until' timestamp" });
     }
 
-    // Validate until > since
+    // Validate until >= since (exclusive end, so an empty range is valid)
     if (query.since && query.until) {
       const since = new Date(query.since).getTime();
       const until = new Date(query.until).getTime();
-      if (until <= since) {
-        return reply.status(400).send({ error: "'until' must be after 'since'" });
+      if (until < since) {
+        return reply.status(400).send({ error: "'until' must not be earlier than 'since'" });
       }
     }
 
