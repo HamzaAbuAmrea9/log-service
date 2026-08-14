@@ -1,5 +1,5 @@
 import { pool } from "../db.js";
-import { StoredLog, QueryResult, LEVEL_MAP, LEVEL_NAMES } from "../utils/validate.js";
+import { StoredLog, QueryResult, LEVEL_MAP, LEVEL_NAMES, jsonbEqualityCandidates } from "../utils/validate.js";
 import { encodeCursor, decodeCursor } from "../utils/cursor.js";
 
 interface QueryParams {
@@ -60,11 +60,16 @@ export async function queryLogs(params: QueryParams): Promise<QueryResult> {
     values.push(`%${params.q}%`);
   }
 
-  // Filter: attributes
+  // Filter: attributes (GIN-indexed containment; matches strings, numbers,
+  // and booleans so it is equivalent to `attributes->>key = value`)
   if (params.attrFilters) {
     for (const attr of params.attrFilters) {
-      conditions.push(`attributes->>$${paramIdx++} = $${paramIdx++}`);
-      values.push(attr.key, attr.value);
+      const [numObj, strObj] = jsonbEqualityCandidates(attr.key, attr.value);
+      conditions.push(
+        `(attributes @> $${paramIdx}::jsonb OR attributes @> $${paramIdx + 1}::jsonb)`,
+      );
+      values.push(numObj, strObj);
+      paramIdx += 2;
     }
   }
 

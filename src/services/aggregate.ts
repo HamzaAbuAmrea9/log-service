@@ -1,5 +1,5 @@
 import { pool } from "../db.js";
-import { AggregateBucket, LEVEL_MAP } from "../utils/validate.js";
+import { AggregateBucket, LEVEL_MAP, jsonbEqualityCandidates } from "../utils/validate.js";
 
 const BUCKET_INTERVALS: Record<string, string> = {
   "1m": "1 minute",
@@ -50,8 +50,12 @@ export async function aggregateLogs(params: AggregateParams): Promise<AggregateB
 
   if (params.attrFilters) {
     for (const attr of params.attrFilters) {
-      conditions.push(`attributes->>$${paramIdx++} = $${paramIdx++}`);
-      values.push(attr.key, attr.value);
+      const [numObj, strObj] = jsonbEqualityCandidates(attr.key, attr.value);
+      conditions.push(
+        `(attributes @> $${paramIdx}::jsonb OR attributes @> $${paramIdx + 1}::jsonb)`,
+      );
+      values.push(numObj, strObj);
+      paramIdx += 2;
     }
   }
 

@@ -55,6 +55,7 @@ const VALID_LEVELS = new Set(["debug", "info", "warn", "error"]);
 export function validateLogEntry(
   entry: unknown,
   index: number,
+  now: number = Date.now(),
 ): ValidationError | null {
   if (typeof entry !== "object" || entry === null) {
     return { index, reason: "entry must be an object" };
@@ -66,12 +67,11 @@ export function validateLogEntry(
   if (typeof obj.timestamp !== "string") {
     return { index, reason: "timestamp is required and must be a string" };
   }
-  const ts = new Date(obj.timestamp);
-  if (isNaN(ts.getTime())) {
+  const ts = Date.parse(obj.timestamp);
+  if (Number.isNaN(ts)) {
     return { index, reason: "invalid timestamp format" };
   }
-  const fiveMinFromNow = Date.now() + 5 * 60 * 1000;
-  if (ts.getTime() > fiveMinFromNow) {
+  if (ts > now + 5 * 60 * 1000) {
     return {
       index,
       reason: "timestamp must not be more than five minutes in the future",
@@ -128,9 +128,24 @@ export function validateLogEntry(
 
 export function validateBatch(logs: unknown[]): ValidationError[] {
   const errors: ValidationError[] = [];
+  const now = Date.now();
   for (let i = 0; i < logs.length; i++) {
-    const err = validateLogEntry(logs[i], i);
+    const err = validateLogEntry(logs[i], i, now);
     if (err) errors.push(err);
   }
   return errors;
+}
+
+// Builds the two JSON containment objects used to match an attribute equality
+// filter against a JSONB column. The first matches number/boolean stored
+// values, the second matches string values, so `attr.key=value` behaves the
+// same as the text-equality form while still using the GIN index.
+export function jsonbEqualityCandidates(key: string, value: string): [string, string] {
+  let typed: unknown = value;
+  if (value === "true" || value === "false") {
+    typed = value === "true";
+  } else if (/^-?(?:0|[1-9]\d*)(?:\.\d+)?$/.test(value)) {
+    typed = Number(value);
+  }
+  return [JSON.stringify({ [key]: typed }), JSON.stringify({ [key]: value })];
 }

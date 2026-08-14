@@ -4,6 +4,7 @@ import {
   validateBatch,
   LEVEL_MAP,
   LEVEL_NAMES,
+  jsonbEqualityCandidates,
 } from "../utils/validate.js";
 import { encodeCursor, decodeCursor } from "../utils/cursor.js";
 
@@ -201,6 +202,37 @@ describe("validateBatch", () => {
     expect(errors).toHaveLength(2);
     expect(errors[0].index).toBe(1);
     expect(errors[1].index).toBe(2);
+  });
+});
+
+describe("jsonbEqualityCandidates", () => {
+  it("matches stored string values", () => {
+    const [num, str] = jsonbEqualityCandidates("user_id", "42");
+    expect(JSON.parse(num)).toEqual({ user_id: 42 });
+    expect(JSON.parse(str)).toEqual({ user_id: "42" });
+  });
+
+  it("matches stored numeric values", () => {
+    const [num, str] = jsonbEqualityCandidates("retries", "3");
+    expect(JSON.parse(num)).toEqual({ retries: 3 });
+    expect(JSON.parse(str)).toEqual({ retries: "3" });
+  });
+
+  it("matches stored boolean values", () => {
+    const [num, str] = jsonbEqualityCandidates("flag", "true");
+    expect(JSON.parse(num)).toEqual({ flag: true });
+    expect(JSON.parse(str)).toEqual({ flag: "true" });
+  });
+
+  it("handles plain string values", () => {
+    const [num, str] = jsonbEqualityCandidates("region", "us-east");
+    expect(JSON.parse(num)).toEqual({ region: "us-east" });
+    expect(JSON.parse(str)).toEqual({ region: "us-east" });
+  });
+
+  it("escapes special characters in values", () => {
+    const [, str] = jsonbEqualityCandidates("k", 'a"b\\c');
+    expect(JSON.parse(str)).toEqual({ k: 'a"b\\c' });
   });
 });
 
