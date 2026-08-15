@@ -8,6 +8,7 @@ export const pool = new Pool({
   max: config.poolSize,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 5000,
+  options: "-c timezone=UTC",
 });
 
 export async function runMigrations(): Promise<void> {
