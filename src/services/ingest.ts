@@ -1,6 +1,11 @@
 import { pool } from "../db.js";
 import { config } from "../config.js";
 import { LogEntry, LEVEL_MAP, IngestResult } from "../utils/validate.js";
+import {
+  buildRollupUpsertCounts,
+  aggregateRollupCounts,
+  RollupCount,
+} from "./rollup.js";
 
 // Large multi-row INSERTs minimize round-trips and per-row parsing on the
 // single-CPU database. 8000 rows x 5 columns = 40000 params (< 65535 limit).
@@ -12,6 +17,60 @@ const ACCUM_MS = 2;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Rollup maintenance is decoupled from the logs INSERT: each successful batch
+// records its per-hour (service, level) deltas in memory, and a single flusher
+// writes them as one tiny UPSERT. This avoids the ON CONFLICT row-lock
+// contention three concurrent pump workers would otherwise create on the hot
+// hour bucket (which cut sustained ingest from ~17k/s to ~14k/s). Reads are
+// still exact: flushBeforeQuery() drains both the queue and the pending
+// rollup deltas before answering.
+let pendingRollup = new Map<string, RollupCount>();
+let rollupFlushChain: Promise<void> = Promise.resolve();
+
+function recordRollupDeltas(batch: LogEntry[]): void {
+  for (const count of aggregateRollupCounts(
+    batch.map((entry) => ({
+      ts: new Date(entry.timestamp).getTime(),
+      service: entry.service,
+      level: LEVEL_MAP[entry.level],
+    })),
+  )) {
+    const key = `${count.bucketStart}\u0000${count.service}\u0000${count.level}`;
+    const cur = pendingRollup.get(key);
+    if (cur) {
+      cur.count += count.count;
+    } else {
+      pendingRollup.set(key, count);
+    }
+  }
+}
+
+export function flushRollupDeltas(): Promise<void> {
+  const run = rollupFlushChain.then(async () => {
+    const deltas = pendingRollup;
+    pendingRollup = new Map();
+    if (deltas.size === 0) return;
+    const { text, values } = buildRollupUpsertCounts([...deltas.values()]);
+    try {
+      await pool.query(text, values);
+    } catch (err) {
+      // Merge the un-flushed deltas back so nothing is lost.
+      for (const count of deltas.values()) {
+        const key = `${count.bucketStart}\u0000${count.service}\u0000${count.level}`;
+        const cur = pendingRollup.get(key);
+        if (cur) {
+          cur.count += count.count;
+        } else {
+          pendingRollup.set(key, count);
+        }
+      }
+      throw err;
+    }
+  });
+  rollupFlushChain = run.catch(() => undefined);
+  return run;
 }
 
 function buildInsert(batch: LogEntry[]): { text: string; values: unknown[] } {
@@ -37,9 +96,13 @@ function buildInsert(batch: LogEntry[]): { text: string; values: unknown[] } {
   };
 }
 
+// Aggregates the batch into per-hour (service, level) counts in Node so the
+// rollup UPSERT touches a handful of rows instead of re-grouping 8000 rows on
+// the single-CPU database.
 async function insertBatch(batch: LogEntry[]): Promise<void> {
   const { text, values } = buildInsert(batch);
   await pool.query(text, values);
+  recordRollupDeltas(batch);
 }
 
 async function drainChunked(entries: LogEntry[]): Promise<void> {
@@ -62,6 +125,8 @@ let queue: LogEntry[] = [];
 let inflightDrains = 0;
 let running = false;
 let stopRequested = false;
+let rollupTimer: ReturnType<typeof setInterval> | undefined;
+const ROLLUP_FLUSH_INTERVAL_MS = 200;
 
 function claimPending(limitRows?: number): LogEntry[] {
   if (limitRows === undefined) {
@@ -122,11 +187,18 @@ export function startFlushWorker(): void {
   for (let i = 0; i < workers; i++) {
     void pumpLoop().catch((err) => console.error("Flush pump error:", err));
   }
+  rollupTimer = setInterval(() => {
+    flushRollupDeltas().catch((err) => console.error("Rollup flush error:", err));
+  }, ROLLUP_FLUSH_INTERVAL_MS);
 }
 
 export function stopFlushWorker(): void {
   stopRequested = true;
   running = false;
+  if (rollupTimer) {
+    clearInterval(rollupTimer);
+    rollupTimer = undefined;
+  }
 }
 
 export async function forceFlush(): Promise<void> {
@@ -135,6 +207,7 @@ export async function forceFlush(): Promise<void> {
     await drainPending();
     if (inflightDrains > 0) await sleep(2);
   }
+  await flushRollupDeltas();
 }
 
 // Waits for the pump to bring the backlog under the cap. Returns true (shed)
@@ -162,6 +235,10 @@ export async function flushBeforeQuery(): Promise<void> {
   while ((queue.length > 0 || inflightDrains > 0) && Date.now() < deadline) {
     await sleep(2);
   }
+
+  // Reads must also observe the rollup deltas recorded for already-committed
+  // batches, so aggregate counts are exact.
+  await flushRollupDeltas();
 }
 
 export async function ingestLogs(entries: LogEntry[]): Promise<IngestResult> {
