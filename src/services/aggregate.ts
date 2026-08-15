@@ -180,12 +180,10 @@ async function queryRollupRange(
   values.unshift(new Date(fromMs).toISOString(), new Date(toMs).toISOString());
 
   const gc = groupClause(params.group_by);
-  // For 1h buckets bucket_start is already the bucket edge; for 1d buckets we
-  // sum the 24 hourly rollup rows that fall inside each day.
-  const startExpr =
-    interval === "1 hour"
-      ? "bucket_start"
-      : `date_bin($${nextIdx}, bucket_start, '${BUCKET_ORIGIN}'::timestamptz)`;
+  // date_bin on bucket_start is the identity for 1h (hour-aligned rows) and
+  // sums the 24 hourly rows per day for 1d. Using one $N placeholder keeps the
+  // bind-parameter count aligned with the interval value pushed below.
+  const startExpr = `date_bin($${nextIdx}, bucket_start, '${BUCKET_ORIGIN}'::timestamptz)`;
   const query = `
     SELECT
       ${startExpr} AS start,
