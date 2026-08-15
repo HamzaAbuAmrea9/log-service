@@ -15,6 +15,10 @@ export const config = {
   flushWorkers: parseInt(process.env.FLUSH_WORKERS || "3", 10),
   flushIntervalMs: parseInt(process.env.FLUSH_INTERVAL_MS || "5", 10),
   maxBuffered: parseInt(process.env.MAX_BUFFERED || "100000", 10),
+  // When the queue exceeds maxBuffered, POSTs wait up to this long for the
+  // pump to drain it below the cap; if the database still cannot keep up, the
+  // request is shed (503) instead of letting the buffer grow unbounded.
+  backpressureMaxWaitMs: parseInt(process.env.BACKPRESSURE_MAX_WAIT_MS || "500", 10),
   // Reads wait for the pump to commit pending rows before querying, so
   // queries see all accepted logs. When few rows are pending (correctness
   // tests) the wait is generous; when the backlog is huge (ingestion

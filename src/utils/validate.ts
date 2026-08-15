@@ -32,6 +32,7 @@ export interface StoredLog {
 export interface IngestResult {
   accepted: number;
   rejected: Array<{ index: number; reason: string }>;
+  backpressured?: boolean;
 }
 
 export interface QueryResult {

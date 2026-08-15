@@ -27,8 +27,7 @@ services:
         -c max_parallel_workers_per_gather=0
         -c max_parallel_workers=0
         -c autovacuum=on
-        -c autovacuum_vacuum_scale_factor=0.02
-        -c autovacuum_analyze_scale_factor=0.01
+        -c gin_pending_list_limit=131072
         -c jit=off
     ports:
       - "5433:5432"
@@ -57,6 +56,8 @@ services:
       LOADGEN_API_KEY: "${LOADGEN_API_KEY:-}"
       RATE_LIMIT_ENABLED: "${RATE_LIMIT_ENABLED:-false}"
       POOL_SIZE: "40"
+      MAX_BUFFERED: "150000"
+      BACKPRESSURE_MAX_WAIT_MS: "500"
     depends_on:
       postgres:
         condition: service_healthy

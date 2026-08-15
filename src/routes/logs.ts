@@ -46,6 +46,13 @@ export async function logsRoutes(app: FastifyInstance): Promise<void> {
     // Ingest valid entries
     const result = await ingestLogs(validEntries);
 
+    if (result.backpressured) {
+      return reply
+        .status(503)
+        .header("Retry-After", "1")
+        .send({ error: "service is at capacity; retry shortly" });
+    }
+
     return reply.status(200).send({
       accepted: result.accepted,
       rejected: errors,

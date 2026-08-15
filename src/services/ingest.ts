@@ -137,6 +137,18 @@ export async function forceFlush(): Promise<void> {
   }
 }
 
+// Waits for the pump to bring the backlog under the cap. Returns true (shed)
+// only if the pump failed to make progress within the budget. Passive by
+// design: only the pump workers INSERT, so concurrency stays low.
+async function backpressureGate(): Promise<boolean> {
+  const deadline = Date.now() + config.backpressureMaxWaitMs;
+  while (Date.now() < deadline) {
+    if (queue.length <= config.maxBuffered) return false;
+    await sleep(2);
+  }
+  return queue.length > config.maxBuffered;
+}
+
 export async function flushBeforeQuery(): Promise<void> {
   if (!config.bufferedIngest) return;
   const pending = queue.length;
@@ -158,13 +170,17 @@ export async function ingestLogs(entries: LogEntry[]): Promise<IngestResult> {
   }
 
   if (config.bufferedIngest) {
-    queue = queue.concat(entries);
-
-    // Bound memory + keep latency flat: if the queue is too deep, wait for
-    // the pump to drain it so this request absorbs the backpressure cost.
-    if (queue.length >= config.maxBuffered) {
-      await flushBeforeQuery();
+    // Check the cap before enqueueing: a shed (503) request must NOT leave its
+    // entries in the queue, otherwise the DB fills with logs the client was
+    // told were not accepted.
+    if (queue.length + entries.length >= config.maxBuffered) {
+      const shed = await backpressureGate();
+      if (shed) {
+        return { accepted: 0, rejected: [], backpressured: true };
+      }
     }
+
+    for (const entry of entries) queue.push(entry);
 
     return { accepted: entries.length, rejected: [] };
   }
