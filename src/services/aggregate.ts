@@ -1,8 +1,10 @@
 import { pool } from "../db.js";
-import { AggregateBucket, LEVEL_MAP, jsonbEqualityCandidates } from "../utils/validate.js";
+import { AggregateBucket, LEVEL_MAP, LEVEL_NAMES, jsonbEqualityCandidates } from "../utils/validate.js";
+import { memCoversSince, sumBuckets } from "./memrollup.js";
 
 const HOUR_MS = 3600000;
 const DAY_MS = 86400000;
+const MINUTE_MS = 60000;
 const BUCKET_ORIGIN = "2000-01-01";
 
 const BUCKETS: Record<string, { interval: string; ms: number }> = {
@@ -27,65 +29,158 @@ function floorTo(ms: number, size: number): number {
   return Math.floor(ms / size) * size;
 }
 
-// The hourly rollup (migration 011) can serve any aggregate whose buckets are
-// aligned to hours or coarser (1h, 1d: day buckets are sums of their 24 hourly
-// rows) and whose filters are service/level only. Text and attribute filters
-// cannot be rolled up and fall back to the live scan.
-function canUseRollup(params: AggregateParams): boolean {
-  if (params.bucket !== "1h" && params.bucket !== "1d") return false;
-  if (params.q) return false;
-  if (params.attrFilters && params.attrFilters.length > 0) return false;
-  return true;
-}
-
-function groupClause(groupBy?: string): {
-  select: string;
-  group: string;
-} {
-  if (groupBy === "service") {
-    return { select: "service AS group_name", group: ", service" };
-  }
-  if (groupBy === "level") {
-    return {
-      select: `CASE level WHEN 0 THEN 'debug' WHEN 1 THEN 'info' WHEN 2 THEN 'warn' WHEN 3 THEN 'error' END AS group_name`,
-      group: ", level",
-    };
-  }
-  return { select: "NULL AS group_name", group: "" };
-}
-
-function parseFilters(
-  params: AggregateParams,
-  startIdx: number,
-): { conditions: string[]; values: unknown[]; nextIdx: number } {
-  const conditions: string[] = [];
-  const values: unknown[] = [];
-  let idx = startIdx;
-  if (params.service) {
-    conditions.push(`service = $${idx++}`);
-    values.push(params.service);
-  }
-  if (params.level) {
-    const levelNum = LEVEL_MAP[params.level];
-    if (levelNum === undefined) {
-      throw new Error(`Invalid level: ${params.level}`);
-    }
-    conditions.push(`level = $${idx++}`);
-    values.push(levelNum);
-  }
-  return { conditions, values, nextIdx: idx };
-}
-
 export async function aggregateLogs(params: AggregateParams): Promise<AggregateBucket[]> {
   const bucket = BUCKETS[params.bucket];
   if (!bucket) {
     throw new Error(`Invalid bucket: '${params.bucket}'. Must be one of: 1m, 5m, 1h, 1d`);
   }
 
-  if (canUseRollup(params)) {
+  // Text and attribute filters cannot be answered from the rollup or the
+  // in-memory mirror; they always fall back to the live scan.
+  if (!params.q && (!params.attrFilters || params.attrFilters.length === 0)) {
+    return aggregateHybrid(params, bucket);
+  }
+  return aggregateLive(params, bucket.interval);
+}
+
+// Serves any filter-free window from the in-memory minute mirror, with only the
+// (at most two) partial boundary minutes live-counted:
+//
+//   sliver1 = [since, nextMinute)   live scan  (<= 1 minute of rows)
+//   interior = [nextMinute, prevMinute)  whole minutes from memory (exact)
+//   sliver2 = [prevMinute, until)   live scan  (<= 1 minute of rows)
+//
+// Rows in a boundary sliver never cross a bucket boundary (the sliver is
+// shorter than one minute, and every bucket size is a multiple of a minute),
+// and the whole-minute interior is exact because memory is authoritative for
+// every row >= nextMinute. The three parts are merged by (start, group) since
+// a sliver and the interior can land in the same bucket. When the window is not
+// memory-covered, the pre-existing rollup/live paths are used unchanged.
+async function aggregateHybrid(
+  params: AggregateParams,
+  bucket: { interval: string; ms: number },
+): Promise<AggregateBucket[]> {
+  const sinceMs = new Date(params.since).getTime();
+  const untilMs = new Date(params.until).getTime();
+  if (untilMs <= sinceMs) return [];
+
+  const nextMinute = Math.ceil(sinceMs / MINUTE_MS) * MINUTE_MS;
+  const prevMinute = Math.floor(untilMs / MINUTE_MS) * MINUTE_MS;
+
+  // Less than one whole minute of interior: the window spans at most two
+  // minutes, so scanning it live is cheap and exactly the old behaviour.
+  if (nextMinute >= prevMinute) {
+    return aggregateLive(params, bucket.interval);
+  }
+
+  if (memCoversSince(nextMinute)) {
+    const sliver1 = await queryBucketRange(params, sinceMs, nextMinute, bucket.interval);
+    const interior = aggregateMemoryInterior(params, nextMinute, prevMinute, bucket.ms);
+    const sliver2 = await queryBucketRange(params, prevMinute, untilMs, bucket.interval);
+    return mergeBuckets([sliver1, interior, sliver2]);
+  }
+
+  // Not covered by memory: 1h/1d use the hourly rollup (edges live + middle
+  // from log_rollup), 1m/5m scan the whole window live — exactly what the
+  // service did before the memory mirror existed.
+  if (bucket.ms >= HOUR_MS) {
     return aggregateFromRollup(params, bucket);
   }
   return aggregateLive(params, bucket.interval);
+}
+
+// Sums the whole minutes in [fromMs, toMs) (both minute-aligned, guaranteed
+// covered) into AggregateBuckets, applying the service/level filters and the
+// group_by in JS. The bucket grid is anchored at the same 2000-01-01 UTC
+// origin date_bin uses, so bucket starts match the SQL path byte for byte.
+function aggregateMemoryInterior(
+  params: AggregateParams,
+  fromMs: number,
+  toMs: number,
+  bucketMs: number,
+): AggregateBucket[] {
+  const buckets = sumBuckets(fromMs, toMs, bucketMs);
+  const rows: AggregateBucket[] = [];
+  const levelFilter = params.level !== undefined ? LEVEL_MAP[params.level] : undefined;
+
+  for (const [bStart, bySvc] of buckets) {
+    const start = new Date(bStart).toISOString();
+    const svcIt = [...bySvc.entries()].filter(([svc]) => !params.service || svc === params.service);
+    if (svcIt.length === 0) continue;
+
+    if (!params.group_by) {
+      let count = 0;
+      for (const [, byLvl] of svcIt) {
+        for (const [lvl, cnt] of byLvl) {
+          if (levelFilter === undefined || lvl === levelFilter) count += cnt;
+        }
+      }
+      if (count > 0) rows.push({ start, group: null, count });
+      continue;
+    }
+
+    if (params.group_by === "service") {
+      for (const [svc, byLvl] of svcIt) {
+        let count = 0;
+        for (const [lvl, cnt] of byLvl) {
+          if (levelFilter === undefined || lvl === levelFilter) count += cnt;
+        }
+        if (count > 0) rows.push({ start, group: svc, count });
+      }
+      continue;
+    }
+
+    const perLevel = new Map<number, number>();
+    for (const [, byLvl] of svcIt) {
+      for (const [lvl, cnt] of byLvl) {
+        if (levelFilter !== undefined && lvl !== levelFilter) continue;
+        perLevel.set(lvl, (perLevel.get(lvl) ?? 0) + cnt);
+      }
+    }
+    for (const [lvl, count] of perLevel) {
+      rows.push({ start, group: LEVEL_NAMES[lvl], count });
+    }
+  }
+  return rows;
+}
+
+// Merges possibly-overlapping bucket lists (a boundary sliver and the memory
+// interior can both contribute to the same bucket) by summing counts per
+// (start, group), then sorts deterministically.
+function mergeBuckets(lists: AggregateBucket[][]): AggregateBucket[] {
+  const byKey = new Map<string, AggregateBucket>();
+  for (const list of lists) {
+    for (const row of list) {
+      const key = `${row.start}\u0000${row.group ?? ""}`;
+      const cur = byKey.get(key);
+      if (cur) {
+        cur.count += row.count;
+      } else {
+        byKey.set(key, { ...row });
+      }
+    }
+  }
+  const rows = [...byKey.values()];
+  sortBuckets(rows);
+  return rows;
+}
+
+function sortBuckets(rows: AggregateBucket[]): void {
+  rows.sort((a, b) =>
+    a.start < b.start
+      ? -1
+      : a.start > b.start
+        ? 1
+        : a.group === b.group
+          ? 0
+          : a.group === null
+            ? -1
+            : b.group === null
+              ? 1
+              : a.group < b.group
+                ? -1
+                : 1,
+  );
 }
 
 // Serves whole middle buckets from log_rollup and live-counts only the two
@@ -122,21 +217,7 @@ async function aggregateFromRollup(
     rows.push(...mid);
   }
 
-  rows.sort((a, b) =>
-    a.start < b.start
-      ? -1
-      : a.start > b.start
-        ? 1
-        : a.group === b.group
-          ? 0
-          : a.group === null
-            ? -1
-            : b.group === null
-              ? 1
-              : a.group < b.group
-                ? -1
-                : 1,
-  );
+  sortBuckets(rows);
   return rows;
 }
 
@@ -163,7 +244,7 @@ async function queryBucketRange(
   values.push(interval);
   const { rows } = await pool.query(query, values);
   return rows.map((row) => ({
-    start: row.start,
+    start: new Date(row.start).toISOString(),
     group: row.group_name,
     count: row.count,
   }));
@@ -196,7 +277,7 @@ async function queryRollupRange(
   values.push(interval);
   const { rows } = await pool.query(query, values);
   return rows.map((row) => ({
-    start: row.start,
+    start: new Date(row.start).toISOString(),
     group: row.group_name,
     count: row.count,
   }));
@@ -258,8 +339,46 @@ async function aggregateLive(
   const { rows } = await pool.query(query, values);
 
   return rows.map((row) => ({
-    start: row.start,
+    start: new Date(row.start).toISOString(),
     group: row.group_name,
     count: row.count,
   }));
+}
+
+function groupClause(groupBy?: string): {
+  select: string;
+  group: string;
+} {
+  if (groupBy === "service") {
+    return { select: "service AS group_name", group: ", service" };
+  }
+  if (groupBy === "level") {
+    return {
+      select: `CASE level WHEN 0 THEN 'debug' WHEN 1 THEN 'info' WHEN 2 THEN 'warn' WHEN 3 THEN 'error' END AS group_name`,
+      group: ", level",
+    };
+  }
+  return { select: "NULL AS group_name", group: "" };
+}
+
+function parseFilters(
+  params: AggregateParams,
+  startIdx: number,
+): { conditions: string[]; values: unknown[]; nextIdx: number } {
+  const conditions: string[] = [];
+  const values: unknown[] = [];
+  let idx = startIdx;
+  if (params.service) {
+    conditions.push(`service = $${idx++}`);
+    values.push(params.service);
+  }
+  if (params.level) {
+    const levelNum = LEVEL_MAP[params.level];
+    if (levelNum === undefined) {
+      throw new Error(`Invalid level: ${params.level}`);
+    }
+    conditions.push(`level = $${idx++}`);
+    values.push(levelNum);
+  }
+  return { conditions, values, nextIdx: idx };
 }

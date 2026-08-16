@@ -6,6 +6,7 @@ import {
   aggregateRollupCounts,
   RollupCount,
 } from "./rollup.js";
+import { recordMinuteCounts } from "./memrollup.js";
 
 // Large multi-row INSERTs minimize round-trips and per-row parsing on the
 // single-CPU database. 8000 rows x 5 columns = 40000 params (< 65535 limit).
@@ -29,14 +30,10 @@ function sleep(ms: number): Promise<void> {
 let pendingRollup = new Map<string, RollupCount>();
 let rollupFlushChain: Promise<void> = Promise.resolve();
 
-function recordRollupDeltas(batch: LogEntry[]): void {
-  for (const count of aggregateRollupCounts(
-    batch.map((entry) => ({
-      ts: new Date(entry.timestamp).getTime(),
-      service: entry.service,
-      level: LEVEL_MAP[entry.level],
-    })),
-  )) {
+function recordRollupDeltas(
+  rows: Array<{ ts: number; service: string; level: number }>,
+): void {
+  for (const count of aggregateRollupCounts(rows)) {
     const key = `${count.bucketStart}\u0000${count.service}\u0000${count.level}`;
     const cur = pendingRollup.get(key);
     if (cur) {
@@ -102,7 +99,15 @@ function buildInsert(batch: LogEntry[]): { text: string; values: unknown[] } {
 async function insertBatch(batch: LogEntry[]): Promise<void> {
   const { text, values } = buildInsert(batch);
   await pool.query(text, values);
-  recordRollupDeltas(batch);
+  // Post-commit bookkeeping, split once: the hourly rollup deltas and the
+  // in-memory minute mirror both consume the same per-row projection.
+  const rows = batch.map((entry) => ({
+    ts: new Date(entry.timestamp).getTime(),
+    service: entry.service,
+    level: LEVEL_MAP[entry.level],
+  }));
+  recordMinuteCounts(rows);
+  recordRollupDeltas(rows);
 }
 
 async function drainChunked(entries: LogEntry[]): Promise<void> {

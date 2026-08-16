@@ -6,6 +6,7 @@ import { aggregateRoutes } from "./routes/aggregate.js";
 import { healthRoutes, markHealthy } from "./routes/health.js";
 import { startRetentionWorker } from "./services/retention.js";
 import { forceFlush, startFlushWorker } from "./services/ingest.js";
+import { initMemRollup } from "./services/memrollup.js";
 import { authMiddleware, seedLoadgenKey } from "./services/auth.js";
 import { rateLimitMiddleware } from "./services/ratelimit.js";
 
@@ -49,6 +50,11 @@ async function main(): Promise<void> {
 
   console.log("Running migrations...");
   await runMigrations();
+
+  // Establish the memory mirror floor (max committed timestamp) before the
+  // flush worker records its first batch, so the coverage invariant holds from
+  // the very first insert.
+  await initMemRollup();
 
   // Seed loadgen API key (must happen before markHealthy)
   seedLoadgenKey();
