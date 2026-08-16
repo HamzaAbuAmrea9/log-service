@@ -9,8 +9,9 @@
 -- already uses. Removing it eliminates one B-tree insert per row.
 --
 -- Note: enabling GIN fastupdate on idx_logs_attributes_path was tried and
--- rejected — under sustained load the pending list grows unboundedly and the
--- next search pays a full cleanup (measured post-load attr search: 6ms ->
--- 5.5s), so the attributes index stays on fastupdate=off.
+-- initially rejected — under sustained load the pending list grows unboundedly
+-- and the next search pays a full cleanup (measured post-load attr search:
+-- 6ms -> 5.5s). Migration 013 re-enables it WITH a periodic in-app drain
+-- (startGinMaintain) that bounds the pending list, fixing that regression.
 
 ALTER TABLE logs DROP CONSTRAINT IF EXISTS logs_pkey;

@@ -5,6 +5,7 @@ import { logsRoutes } from "./routes/logs.js";
 import { aggregateRoutes } from "./routes/aggregate.js";
 import { healthRoutes, markHealthy } from "./routes/health.js";
 import { startRetentionWorker } from "./services/retention.js";
+import { startGinMaintain } from "./services/ginmaintain.js";
 import { forceFlush, startFlushWorker } from "./services/ingest.js";
 import { initMemRollup } from "./services/memrollup.js";
 import { authMiddleware, seedLoadgenKey } from "./services/auth.js";
@@ -61,6 +62,9 @@ async function main(): Promise<void> {
 
   // Start retention worker
   startRetentionWorker();
+
+  // Start GIN pending-list maintenance
+  startGinMaintain();
 
   // Start buffered-ingestion flush worker
   startFlushWorker();
