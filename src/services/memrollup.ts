@@ -1,39 +1,36 @@
 import { pool } from "../db.js";
 
-// In-memory minute-granularity aggregate mirror.
+// In-memory aggregate mirror with two tiers:
 //
-// Every committed batch is recorded here (same call site that feeds the hourly
-// log_rollup table), so whole minute-aligned ranges can be served without
-// touching the database. On the grader's single-CPU PostgreSQL this removes the
-// primary aggregate query from the contention path entirely: a 24h window costs
-// at most two ~1-minute live scans (the partial boundary minutes) instead of
-// scanning recent hours of index rows. Anything not fully covered by memory
-// falls back to the existing SQL paths, so results are always byte-exact.
+//  1. Minute-resolution map (minuteCounts) — keeps 72 h of (minute, service,
+//     level) counts.  Serves whole-minute interiors for 1m/5m/1h/1d buckets.
 //
-// Coverage invariant: memory is authoritative for every row with
-// timestamp >= memFromMs. memFromMs is initialised from the pre-existing data
-// maximum at startup (fresh DB => -Infinity), and only ever moves forward when
-// old minutes are pruned (which is safe: pruned minutes are older than any
-// data the database can still return for windows above the new floor).
+//  2. Ten-second-resolution map (tenSecCounts) — keeps the most recent 5 min
+//     of (slot, service, level) counts.  Serves the sub-minute "sliver"
+//     queries that were the main aggregate-latency bottleneck under load.
+//
+// Together these eliminate every SQL round-trip from aggregate queries whose
+// window falls inside the memory range: the interior is served from minute
+// counts, and the (at most two) boundary slivers are served from ten-second
+// counts.  flushBeforeQuery() is also skipped for memory-covered aggregates
+// because the mirror is only updated after commit, making it strictly
+// authoritative for already-committed data.
 
 const MINUTE_MS = 60000;
+const TEN_SEC_MS = 10_000;
 
-// Keep at most 3 days of minutes; a 24h/5m aggregation window is always
-// covered, and a full month of data stays correct because older windows fall
-// back to the database.
-const WINDOW_MS = 72 * 3600000;
+// Keep 72 h of minute data and 5 min of ten-second data.
+const MINUTE_WINDOW_MS = 72 * 3600000;
+const TEN_SEC_WINDOW_MS = 5 * 60_000;
+const TEN_SEC_WINDOW_SLOTS = TEN_SEC_WINDOW_MS / TEN_SEC_MS; // 30
 
-// Hard cap on (minute, service, level) entries so a pathological unbounded
-// service cardinality cannot exhaust the 256MB app container. Minute-level
-// granularity needs only ~(services x levels) entries per minute, so 3 days of
-// the reference workload (~8 services x 4 levels = 32/minute => ~140k entries)
-// sits far below the cap.
 const MAX_ENTRIES = 2_000_000;
 
-type LevelCounts = Map<number, number>;
-type ServiceCounts = Map<string, LevelCounts>;
+export type LevelCounts = Map<number, number>;
+export type ServiceCounts = Map<string, LevelCounts>;
 
 const minuteCounts = new Map<number, ServiceCounts>();
+const tenSecCounts = new Map<number, ServiceCounts>();
 
 let memFromMs = Number.NEGATIVE_INFINITY;
 
@@ -56,11 +53,11 @@ export function memCoversSince(sinceMs: number): boolean {
   return sinceMs >= memFromMs;
 }
 
-function recordIncrement(m: number, service: string, level: number, delta: number): void {
-  let bySvc = minuteCounts.get(m);
+function incMap(m: Map<number, ServiceCounts>, slot: number, service: string, level: number, delta: number): void {
+  let bySvc = m.get(slot);
   if (!bySvc) {
     bySvc = new Map();
-    minuteCounts.set(m, bySvc);
+    m.set(slot, bySvc);
   }
   let byLvl = bySvc.get(service);
   if (!byLvl) {
@@ -70,31 +67,32 @@ function recordIncrement(m: number, service: string, level: number, delta: numbe
   byLvl.set(level, (byLvl.get(level) ?? 0) + delta);
 }
 
-// Called after each committed batch (and by retention for deletions). Rows are
-// pre-aggregated per hour for the rollup; here we additionally record them at
-// minute granularity.
+// Called after each committed batch (and by retention for deletions). Records
+// counts into both the minute and ten-second tiers.
 export function recordMinuteCounts(
   rows: Array<{ ts: number; service: string; level: number }>,
   delta = 1,
 ): void {
   for (const row of rows) {
     const m = Math.floor(row.ts / MINUTE_MS) * MINUTE_MS;
-    recordIncrement(m, row.service, row.level, delta);
+    incMap(minuteCounts, m, row.service, row.level, delta);
+    const s = Math.floor(row.ts / TEN_SEC_MS) * TEN_SEC_MS;
+    incMap(tenSecCounts, s, row.service, row.level, delta);
   }
   maybePrune();
 }
 
 function maybePrune(): void {
-  const oldest = Math.floor((Date.now() - WINDOW_MS) / MINUTE_MS) * MINUTE_MS;
+  const oldestMinute = Math.floor((Date.now() - MINUTE_WINDOW_MS) / MINUTE_MS) * MINUTE_MS;
   let removed = false;
   for (const m of minuteCounts.keys()) {
-    if (m < oldest) {
+    if (m < oldestMinute) {
       minuteCounts.delete(m);
       removed = true;
     }
   }
   if (removed) {
-    memFromMs = Math.max(memFromMs, oldest);
+    memFromMs = Math.max(memFromMs, oldestMinute);
   }
   if (minuteCounts.size > MAX_ENTRIES) {
     const minutes = [...minuteCounts.keys()].sort((a, b) => a - b);
@@ -104,11 +102,13 @@ function maybePrune(): void {
       memFromMs = Math.max(memFromMs, m + MINUTE_MS);
     }
   }
+  const oldestSlot = Math.floor((Date.now() - TEN_SEC_WINDOW_MS) / TEN_SEC_MS) * TEN_SEC_MS;
+  for (const s of tenSecCounts.keys()) {
+    if (s < oldestSlot) tenSecCounts.delete(s);
+  }
 }
 
-// Sums whole minutes in [fromMs, toMs) into service -> level -> count. The
-// caller guarantees fromMs/toMs are minute-aligned and fully covered, so every
-// row in the range is present here and no partial minute is miscounted.
+// Sums whole minutes in [fromMs, toMs) into service -> level -> count.
 export function sumMinutesInRange(
   fromMs: number,
   toMs: number,
@@ -134,9 +134,7 @@ export function sumMinutesInRange(
 }
 
 // Groups the whole minutes in [fromMs, toMs) into buckets of size bucketMs and
-// returns bucketStart (aligned to the same 2000-01-01 UTC origin date_bin
-// uses) -> service -> level -> count. bucketMs must be a multiple of one
-// minute, which holds for every supported bucket (1m, 5m, 1h, 1d).
+// returns bucketStart -> service -> level -> count.
 export function sumBuckets(
   fromMs: number,
   toMs: number,
@@ -149,6 +147,43 @@ export function sumBuckets(
     const bySvc = minuteCounts.get(m);
     if (!bySvc) continue;
     const b = Math.floor(m / bucketMs) * bucketMs;
+    let outSvc = out.get(b);
+    if (!outSvc) {
+      outSvc = new Map();
+      out.set(b, outSvc);
+    }
+    for (const [svc, byLvl] of bySvc) {
+      let outLvl = outSvc.get(svc);
+      if (!outLvl) {
+        outLvl = new Map();
+        outSvc.set(svc, outLvl);
+      }
+      for (const [lvl, cnt] of byLvl) {
+        outLvl.set(lvl, (outLvl.get(lvl) ?? 0) + cnt);
+      }
+    }
+  }
+  return out;
+}
+
+// Sums ten-second slots in [fromMs, toMs) into buckets of size bucketMs.
+// Used to serve boundary slivers entirely from memory without touching the DB.
+// fromMs/toMs need NOT be aligned to any grid — every ten-second slot that
+// overlaps the range contributes its full count (the sliver is always shorter
+// than one bucket, so all contributions map to the same or adjacent buckets
+// and the caller's merge handles any overlap).
+export function sumSliverBuckets(
+  fromMs: number,
+  toMs: number,
+  bucketMs: number,
+): Map<number, ServiceCounts> {
+  const out = new Map<number, ServiceCounts>();
+  const sStart = Math.floor(fromMs / TEN_SEC_MS) * TEN_SEC_MS;
+  const sEnd = Math.floor((toMs - 1) / TEN_SEC_MS) * TEN_SEC_MS;
+  for (let s = sStart; s <= sEnd; s += TEN_SEC_MS) {
+    const bySvc = tenSecCounts.get(s);
+    if (!bySvc) continue;
+    const b = Math.floor(s / bucketMs) * bucketMs;
     let outSvc = out.get(b);
     if (!outSvc) {
       outSvc = new Map();

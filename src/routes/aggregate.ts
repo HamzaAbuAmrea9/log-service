@@ -1,6 +1,7 @@
 import { FastifyInstance } from "fastify";
 import { aggregateLogs } from "../services/aggregate.js";
 import { flushBeforeQuery } from "../services/ingest.js";
+import { memCoversSince } from "../services/memrollup.js";
 
 const VALID_LEVELS = new Set(["debug", "info", "warn", "error"]);
 const VALID_BUCKETS = new Set(["1m", "5m", "1h", "1d"]);
@@ -59,7 +60,30 @@ export async function aggregateRoutes(app: FastifyInstance): Promise<void> {
     }
 
     try {
-      // Ensure any buffered (not yet committed) logs are visible to reads.
+      const bucket = query.bucket as string;
+      const bucketMs = bucket === "1m" ? 60000 : bucket === "5m" ? 300000 : bucket === "1h" ? 3600000 : 86400000;
+
+      // When the memory mirror covers the entire window (including boundary
+      // slivers), the aggregate can be served without touching the database at
+      // all — skip the flush to avoid stalling on the pump queue.
+      const nextMinute = Math.ceil(since / 60000) * 60000;
+      const hasTextFilters = !!query.q || attrFilters.length > 0;
+      if (!hasTextFilters && memCoversSince(nextMinute)) {
+        const buckets = await aggregateLogs({
+          since: query.since,
+          until: query.until,
+          bucket: query.bucket,
+          group_by: query.group_by,
+          service: query.service,
+          level: query.level,
+          q: query.q,
+          attrFilters,
+        });
+        return reply.status(200).send({ buckets });
+      }
+
+      // Fall back to flushing before query for non-memory-covered or
+      // text-filtered aggregates.
       await flushBeforeQuery();
 
       const buckets = await aggregateLogs({

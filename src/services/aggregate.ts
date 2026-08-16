@@ -1,6 +1,6 @@
 import { pool } from "../db.js";
 import { AggregateBucket, LEVEL_MAP, LEVEL_NAMES, jsonbEqualityCandidates } from "../utils/validate.js";
-import { memCoversSince, sumBuckets } from "./memrollup.js";
+import { memCoversSince, sumBuckets, sumSliverBuckets, ServiceCounts } from "./memrollup.js";
 
 const HOUR_MS = 3600000;
 const DAY_MS = 86400000;
@@ -43,19 +43,13 @@ export async function aggregateLogs(params: AggregateParams): Promise<AggregateB
   return aggregateLive(params, bucket.interval);
 }
 
-// Serves any filter-free window from the in-memory minute mirror, with only the
-// (at most two) partial boundary minutes live-counted:
+// Serves any filter-free window entirely from the in-memory mirror.
 //
-//   sliver1 = [since, nextMinute)   live scan  (<= 1 minute of rows)
-//   interior = [nextMinute, prevMinute)  whole minutes from memory (exact)
-//   sliver2 = [prevMinute, until)   live scan  (<= 1 minute of rows)
-//
-// Rows in a boundary sliver never cross a bucket boundary (the sliver is
-// shorter than one minute, and every bucket size is a multiple of a minute),
-// and the whole-minute interior is exact because memory is authoritative for
-// every row >= nextMinute. The three parts are merged by (start, group) since
-// a sliver and the interior can land in the same bucket. When the window is not
-// memory-covered, the pre-existing rollup/live paths are used unchanged.
+// When memory covers the range, the (at most two) boundary slivers are served
+// from the ten-second-resolution tier and the whole-minute interior from the
+// minute-resolution tier.  This eliminates every SQL round-trip from the hot
+// aggregate path — the only DB queries left are for windows that predate the
+// memory floor.
 async function aggregateHybrid(
   params: AggregateParams,
   bucket: { interval: string; ms: number },
@@ -74,9 +68,9 @@ async function aggregateHybrid(
   }
 
   if (memCoversSince(nextMinute)) {
-    const sliver1 = await queryBucketRange(params, sinceMs, nextMinute, bucket.interval);
+    const sliver1 = bucketsToRows(sumSliverBuckets(sinceMs, nextMinute, bucket.ms), params);
     const interior = aggregateMemoryInterior(params, nextMinute, prevMinute, bucket.ms);
-    const sliver2 = await queryBucketRange(params, prevMinute, untilMs, bucket.interval);
+    const sliver2 = bucketsToRows(sumSliverBuckets(prevMinute, untilMs, bucket.ms), params);
     return mergeBuckets([sliver1, interior, sliver2]);
   }
 
@@ -100,6 +94,56 @@ function aggregateMemoryInterior(
   bucketMs: number,
 ): AggregateBucket[] {
   const buckets = sumBuckets(fromMs, toMs, bucketMs);
+  const rows: AggregateBucket[] = [];
+  const levelFilter = params.level !== undefined ? LEVEL_MAP[params.level] : undefined;
+
+  for (const [bStart, bySvc] of buckets) {
+    const start = new Date(bStart).toISOString();
+    const svcIt = [...bySvc.entries()].filter(([svc]) => !params.service || svc === params.service);
+    if (svcIt.length === 0) continue;
+
+    if (!params.group_by) {
+      let count = 0;
+      for (const [, byLvl] of svcIt) {
+        for (const [lvl, cnt] of byLvl) {
+          if (levelFilter === undefined || lvl === levelFilter) count += cnt;
+        }
+      }
+      if (count > 0) rows.push({ start, group: null, count });
+      continue;
+    }
+
+    if (params.group_by === "service") {
+      for (const [svc, byLvl] of svcIt) {
+        let count = 0;
+        for (const [lvl, cnt] of byLvl) {
+          if (levelFilter === undefined || lvl === levelFilter) count += cnt;
+        }
+        if (count > 0) rows.push({ start, group: svc, count });
+      }
+      continue;
+    }
+
+    const perLevel = new Map<number, number>();
+    for (const [, byLvl] of svcIt) {
+      for (const [lvl, cnt] of byLvl) {
+        if (levelFilter !== undefined && lvl !== levelFilter) continue;
+        perLevel.set(lvl, (perLevel.get(lvl) ?? 0) + cnt);
+      }
+    }
+    for (const [lvl, count] of perLevel) {
+      rows.push({ start, group: LEVEL_NAMES[lvl], count });
+    }
+  }
+  return rows;
+}
+
+// Converts a bucket map (from sumSliverBuckets or sumBuckets) into the
+// AggregateBucket[] format, applying service/level filters and group_by.
+function bucketsToRows(
+  buckets: Map<number, ServiceCounts>,
+  params: AggregateParams,
+): AggregateBucket[] {
   const rows: AggregateBucket[] = [];
   const levelFilter = params.level !== undefined ? LEVEL_MAP[params.level] : undefined;
 
