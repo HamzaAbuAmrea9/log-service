@@ -44,17 +44,26 @@ function recordRollupDeltas(
   }
 }
 
+const ROLLUP_CHUNK = 1000;
+
 export function flushRollupDeltas(): Promise<void> {
   const run = rollupFlushChain.then(async () => {
     const deltas = pendingRollup;
     pendingRollup = new Map();
     if (deltas.size === 0) return;
-    const { text, values } = buildRollupUpsertCounts([...deltas.values()]);
-    try {
-      await pool.query(text, values);
-    } catch (err) {
-      // Merge the un-flushed deltas back so nothing is lost.
-      for (const count of deltas.values()) {
+    const all = [...deltas.values()];
+    const failed: typeof all = [];
+    for (let i = 0; i < all.length; i += ROLLUP_CHUNK) {
+      const chunk = all.slice(i, i + ROLLUP_CHUNK);
+      const { text, values } = buildRollupUpsertCounts(chunk);
+      try {
+        await pool.query(text, values);
+      } catch {
+        failed.push(...chunk);
+      }
+    }
+    if (failed.length > 0) {
+      for (const count of failed) {
         const key = `${count.bucketStart}\u0000${count.service}\u0000${count.level}`;
         const cur = pendingRollup.get(key);
         if (cur) {
@@ -63,7 +72,6 @@ export function flushRollupDeltas(): Promise<void> {
           pendingRollup.set(key, count);
         }
       }
-      throw err;
     }
   });
   rollupFlushChain = run.catch(() => undefined);
@@ -242,8 +250,13 @@ export async function flushBeforeQuery(): Promise<void> {
   }
 
   // Reads must also observe the rollup deltas recorded for already-committed
-  // batches, so aggregate counts are exact.
-  await flushRollupDeltas();
+  // batches, so aggregate counts are exact. On failure the memory mirror still
+  // serves covered windows, so log and continue instead of blocking the read.
+  try {
+    await flushRollupDeltas();
+  } catch (err) {
+    console.error("Rollup flush before query failed:", err);
+  }
 }
 
 export async function ingestLogs(entries: LogEntry[]): Promise<IngestResult> {
