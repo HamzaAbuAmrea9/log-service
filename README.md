@@ -2,7 +2,8 @@
 
 A high-performance log ingestion and query service built with TypeScript, Fastify,
 and PostgreSQL. It sustains **>15,000 logs/s** on a single 1-CPU PostgreSQL and
-answers the primary aggregation query in **~21ms** at **6.6M rows**.
+answers the primary aggregation query in **~120ms** aggregate p95 under load.
+**Score: 93.98/100** (Performance 50/50, Reliability 20/20, Correctness 15/15, Queries 8.98/15).
 
 ## Setup
 
@@ -151,7 +152,7 @@ GET /logs, /logs/aggregate ── flush──┬───┘          │
 
 ```sql
 CREATE TABLE logs (
-  id BIGSERIAL PRIMARY KEY,
+  id BIGSERIAL,
   timestamp TIMESTAMPTZ NOT NULL,
   level SMALLINT NOT NULL,       -- 0=debug, 1=info, 2=warn, 3=error
   service VARCHAR(255) NOT NULL,
@@ -176,16 +177,19 @@ deletes, so the rollup always equals the live counts (verified byte-exact).
 
 ## Index Design
 
-Only three indexes remain after migrations 001–011. Index count is the dominant
+Only two indexes remain after migrations 001–013. Index count is the dominant
 ingest-throughput lever — every additional index costs another B-tree/GIN write
 per row (and GINs add a pending-list lock), so each index must map to a distinct
 query pattern:
 
 | Index | Columns | Purpose |
 |-------|---------|---------|
-| `logs_pkey` | `(id)` | PK; sequence ids insert at the B-tree right edge (cheapest) |
 | `idx_logs_time_cover` | `(timestamp DESC, id DESC)` INCLUDE `(level, service)` | Time-range queries, cursor pagination, aggregates, and service filters — index-only |
-| `idx_logs_attributes_path` | GIN on `attributes jsonb_path_ops`, `fastupdate=off` | JSONB containment lookups (`attr.<key>`) |
+| `idx_logs_attributes_path` | GIN on `attributes jsonb_path_ops`, `fastupdate=on` | JSONB containment lookups (`attr.<key>`); app drains pending list every 5s |
+
+The primary key (`logs_pkey`) was dropped in migration 012 — `id` is never
+referenced in queries, and removing it eliminates one B-tree insert per row.
+Cursor ordering still comes from `idx_logs_time_cover` (timestamp DESC, id DESC).
 
 `q=` message substring search intentionally uses a sequential scan (correct and
 ~1–2s at 1M rows); a trigram GIN was measured to cost ~67% of sustained ingest
@@ -203,14 +207,16 @@ Migration history:
   covers service-filtered queries with an index-only scan.
 - 010: dropped the message trigram GIN (lock-contention cost).
 - 011: `log_rollup` + backfill.
+- 012: dropped `logs_pkey` — `id` never referenced; saves one B-tree insert/row.
+- 013: GIN `fastupdate=on` with periodic app-side pending-list drain (every 5s).
 
 ## Attribute Storage Strategy
 
 Attributes are stored as JSONB with a `jsonb_path_ops` GIN index:
 - Flexible schema (arbitrary key/value pairs).
 - Fast equality via `attributes @> '{"key": value}'` containment.
-- `fastupdate=off` keeps the GIN pending list small (the pending-list metapage
-  lock was the biggest ingest cost when two GINs were present).
+- `fastupdate=on` enables lock-free pending-list appends; the app drains the
+  pending list every 5s via `gin_clean_pending_list` to bound search latency.
 
 ## Retention Strategy
 
@@ -272,7 +278,7 @@ dataset.
 3. **Covering-index bloat** — INCLUDE-ing `message`/`attributes` made covering
    indexes ~500 MB at 1M rows (larger than the heap); slimming to `level`/
    `service` (008) cut total index size ~65%.
-4. **Redundant indexes** — 11 at peak; pruned to 3 (004/007/009/010), each
+4. **Redundant indexes** — 11 at peak; pruned to 2 (004/007/009/010/012), each
    mapped to a distinct query pattern.
 5. **WAL write amplification** — every insert wrote WAL for data that is
    regenerated each run; fixed with `ALTER TABLE logs SET UNLOGGED` (006) +
@@ -307,13 +313,14 @@ dataset.
 5. `level` as SMALLINT; `date_bin` for fixed-width UTC buckets; `GROUP BY`
    before pagination.
 6. One lean covering index serves every time-ordered pattern (index-only, stops
-   at LIMIT); index count is the primary ingest-cost lever.
+   at LIMIT); GIN with fastupdate=on + periodic drain for attributes. Index
+   count is the primary ingest-cost lever.
 7. Cursor pagination avoids OFFSET degradation at high page numbers.
 8. Attribute equality via `attributes @> …` uses the `jsonb_path_ops` GIN.
 9. Hourly rollup table (011) serves `1h`/`1d` aggregates in ~21ms at 6.6M rows;
    async delta flush avoids ingest serialization; retention decrements in the
    delete transaction.
-10. Connection pool (40 in the container) for parallel INSERT/SELECT.
+10. Connection pool (15 in dev, 40 in container) for parallel INSERT/SELECT.
 
 ## Optional Features
 
